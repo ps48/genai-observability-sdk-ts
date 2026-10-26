@@ -14,7 +14,7 @@ OTel-native tracing and scoring for LLM applications. Instrument your AI workflo
 - **`enrich()`** — add model, token usage, and other GenAI attributes to the active span from anywhere in your code
 - **`markAgentRoot()`** — mark the agent's span as the trace's agent root in OpenSearch Agent Traces
 - **Auto-instrumentation** — automatically discovers and activates installed instrumentor packages (OpenAI, etc.)
-- **Scoring** — `score()` emits evaluation metrics as OTel spans at span, trace, or standalone level
+- **Scoring**: `score()` emits each evaluation result as an OTel `gen_ai.evaluation.result` log event, parented to the evaluated span
 - **Benchmarks** — `evaluate()` runs your agent against a dataset with scorers; `Benchmark` uploads results from any eval framework
 - **AWS SigV4** — built-in SigV4 signing for AWS-hosted OpenSearch and Data Prepper endpoints
 - **Streaming** — full support for sync/async functions, generators, and async generators
@@ -22,7 +22,7 @@ OTel-native tracing and scoring for LLM applications. Instrument your AI workflo
 
 ## Requirements
 
-- **Node.js**: >= 18
+- **Node.js**: ^18.19.0 or >= 20.6.0 (required by `@opentelemetry/sdk-logs`)
 - **OpenTelemetry API**: ^1.9.0
 
 ## Installation
@@ -73,8 +73,8 @@ const research = observe(
 // 3. Use it
 const result = research("What is OpenSearch?");
 
-// 4. Submit scores (after workflow completes)
-score({ name: "relevance", value: 0.95, traceId: "..." });
+// 4. Submit scores (after workflow completes): pass the evaluated span's ids
+score({ name: "relevance", value: 0.95, traceId: "...", spanId: "..." });
 ```
 
 This produces the following span tree:
@@ -103,6 +103,9 @@ invoke_agent research_agent
 │  │  │   └── OTLPSpanExporter (HTTP or gRPC)      │    │
 │  │  │       └── SigV4 signing (AWS endpoints)    │    │
 │  │  └── Auto-instrumentation                     │    │
+│  │  LoggerProvider (evaluation events)           │    │
+│  │  └── BatchLogRecordProcessor                  │    │
+│  │      └── OTLPLogExporter (HTTP, /v1/logs)     │    │
 │  └──────────────────────────────────────────────┘    │
 └───────────────────────┬──────────────────────────────┘
                         │ OTLP (HTTP/gRPC)
@@ -113,18 +116,18 @@ invoke_agent research_agent
                └────────┬────────┘
                         │
                         ▼
-               ┌─────────────────┐
-               │   OpenSearch     │
-               │  ├── traces      │
-               │  └── scores      │
-               └─────────────────┘
+          ┌───────────────────────────────┐
+          │   OpenSearch                  │
+          │  ├── otel-v1-apm-span-*       │
+          │  └── otel-v1-genai-evaluation │
+          └───────────────────────────────┘
 ```
 
 ## API Reference
 
 ### `register()`
 
-Configures the OTel tracing pipeline. Call once at startup.
+Configures the OTel tracing pipeline and the logs pipeline that carries evaluation events from `score()`. Call once at startup.
 
 ```typescript
 await register({
@@ -160,9 +163,23 @@ await register({
 | `batch` | `boolean` | `true` | Use BatchSpanProcessor when true |
 | `autoInstrument` | `boolean` | `true` | Discover and activate instrumentor packages |
 | `exporter` | `SpanExporter` | — | Custom exporter (overrides endpoint/protocol) |
-| `headers` | `Record<string, string>` | — | Headers for OTLP exporter |
+| `headers` | `Record<string, string>` | none | Headers for OTLP exporter (traces and logs) |
+| `logs` | `boolean` | `true` | Set up a LoggerProvider for evaluation events |
+| `logsEndpoint` | `string` | See resolution below | OTLP/HTTP logs endpoint URL |
+| `logExporter` | `LogRecordExporter` | none | Custom log exporter (overrides `logsEndpoint`) |
 
-**Authenticated endpoints (e.g. AWS OSIS):** pass a custom exporter:
+**Logs pipeline.** `register()` also creates a `LoggerProvider` with a batch processor (simple when `batch: false`) and an OTLP/HTTP log exporter on the same endpoint and auth as traces. `provider.forceFlush()` and `provider.shutdown()` flush and shut down both pipelines. If a global `LoggerProvider` is already registered (for example by `NodeSDK`), `register()` leaves it in place and `score()` emits through it.
+
+**Logs endpoint resolution (priority order):**
+
+1. `logsEndpoint` parameter
+2. `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` env var
+3. `OTEL_EXPORTER_OTLP_ENDPOINT` env var with `/v1/logs` appended (when no traces endpoint is set)
+4. The traces endpoint with a trailing `/v1/traces` replaced by `/v1/logs` (default: `http://localhost:21890/opentelemetry/v1/logs`)
+
+With gRPC traces, or a traces URL that does not end in `/v1/traces`, pass `logsEndpoint`. Otherwise `register()` warns and evaluation events are not exported.
+
+**Authenticated endpoints (e.g. AWS OSIS):** pass a custom exporter. When `exporter` is an `AWSSigV4OTLPExporter`, `register()` creates an `AWSSigV4OTLPLogExporter` with the same service and region for the logs endpoint (`logsEndpoint`, else the traces URL with `/v1/traces` replaced by `/v1/logs`):
 
 ```typescript
 import { register, AWSSigV4OTLPExporter } from "opensearch-genai-observability-sdk-ts";
@@ -317,47 +334,67 @@ Without the SDK, set the span attribute `derived.gen_ai.is_root` to `true` on th
 
 ### `score()`
 
-Submits evaluation scores as OTel spans. The score span is attached to the evaluated trace so it appears in the same trace waterfall.
+Records one evaluation result as an OTel log event with event name `gen_ai.evaluation.result`, following the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-events/). The event carries the trace and span id of the **evaluated** span, so it joins to the trace without adding spans to it. It is exported over OTLP logs (`/v1/logs`). Data Prepper routes these events to the `otel-v1-genai-evaluation` index.
 
 ```typescript
-// Span-level: score a specific span
+// Inline: the evaluated span is the active span
+withObserve("answer", { op: Op.CHAT }, () => {
+  score({ name: "relevance", value: 0.92, label: "relevant", evaluator: "relevance_judge" });
+});
+
+// Offline: score a stored span by id
 score({
   name: "accuracy",
   value: 0.95,
   traceId: "6ebb9835f43af1552f2cebb9f5165e39",
   spanId: "89829115c2128845",
   explanation: "Weather data matches ground truth",
+  evaluator: "accuracy_judge",
+  evaluatorVersion: "1.2.0",
+  evaluatorType: "llm_judge",
+  direction: "maximize",
+  scoreMin: 0,
+  scoreMax: 1,
 });
 
-// Trace-level: score the entire trace (attaches to root span)
-score({
-  name: "relevance",
-  value: 0.92,
-  traceId: "6ebb9835f43af1552f2cebb9f5165e39",
-  explanation: "Response addresses the user's query",
-  attributes: { "test.suite.name": "nightly_eval" },
-});
-
-// Standalone: no trace linkage
-score({ name: "fluency", value: 0.88 });
+// Trace-level: only a trace id is known. The event has no span context and
+// carries opensearch.evaluation.trace_id and opensearch.evaluation.level=trace.
+score({ name: "task_success", value: 1, traceId: "6ebb9835f43af1552f2cebb9f5165e39" });
 ```
+
+The instrumentation scope of the event is the evaluator (`evaluator` / `evaluatorVersion`), or `opensearch-genai-observability-sdk-ts` and the SDK version when no evaluator is named. The timestamp is the time `score()` is called.
 
 **Parameters:**
 
-| Parameter | Type | Description |
-|---|---|---|
-| `name` | `string` | Metric name (e.g., `"relevance"`, `"factuality"`) |
-| `value` | `number` | Numeric score |
-| `traceId` | `string` | Hex trace ID of the trace being scored |
-| `spanId` | `string` | Hex span ID for span-level scoring. When omitted, attaches to root span |
-| `label` | `string` | Human-readable label (`"pass"`, `"relevant"`) |
-| `explanation` | `string` | Evaluator justification (truncated to 500 chars) |
-| `responseId` | `string` | LLM completion ID for correlation |
-| `attributes` | `Record<string, unknown>` | Additional span attributes |
+| Parameter | Type | Attribute | Description |
+|---|---|---|---|
+| `name` | `string` | `gen_ai.evaluation.name` | Metric name (required) |
+| `value` | `number` | `gen_ai.evaluation.score.value` | Numeric score |
+| `label` | `string` | `gen_ai.evaluation.score.label` | Low-cardinality label (`"pass"`, `"relevant"`) |
+| `explanation` | `string` | `gen_ai.evaluation.explanation` | Evaluator rationale (truncated to 500 chars) |
+| `responseId` | `string` | `gen_ai.response.id` | Evaluated completion id, if known |
+| `traceId` | `string` | event trace id | Trace of the evaluated span |
+| `spanId` | `string` | event span id | Evaluated span (requires `traceId`) |
+| `level` | `"span" \| "trace" \| "session" \| "tool_call"` | `opensearch.evaluation.level` | Defaults to `"trace"` for trace-level scores |
+| `evaluator` | `string` | scope name, `opensearch.evaluation.evaluator.name` | Evaluator identity |
+| `evaluatorVersion` | `string` | scope version, `opensearch.evaluation.evaluator.version` | Evaluator version |
+| `evaluatorType` | `"llm_judge" \| "code" \| "human" \| "external"` | `opensearch.evaluation.evaluator.type` | Kind of evaluator |
+| `direction` | `"maximize" \| "minimize"` | `opensearch.evaluation.score.direction` | Whether higher is better |
+| `scoreMin` / `scoreMax` | `number` | `opensearch.evaluation.score.min` / `.max` | Scale bounds |
+| `conversationId` | `string` | `gen_ai.conversation.id` | Session id for session-scoped evaluations |
+| `agentName` | `string` | `gen_ai.agent.name` | Evaluated agent |
+| `errorType` | `string` | `error.type` | Set when the evaluator failed |
+| `judgeTraceId` | `string` | `opensearch.evaluation.judge.trace_id` | The judge's own trace |
+| `carrier` | `"event" \| "span" \| "both"` | | Default `"event"`. See below |
+| `attributes` | `Record<string, unknown>` | | Extra string, number, or boolean attributes |
+
+`opensearch.evaluation.*` attributes are OpenSearch extensions for fields that are still proposals in the GenAI semantic conventions. They will move to `gen_ai.*` names when those proposals merge.
+
+**Deprecated span carrier.** Earlier releases wrote each score as a child span `evaluation <name>` with `gen_ai.operation.name=evaluation` and a span event. That behavior is kept for one release behind `carrier: "span"` or the env var `OPENSEARCH_GENAI_EVAL_CARRIER=span`, and logs a one-time deprecation warning. `carrier: "both"` emits the event and the span, for migrating dashboards. In both carriers a trace-level score no longer attaches to a span id derived from the low 64 bits of the trace id: that span does not exist.
 
 ### `evaluate()`
 
-Run a task against a dataset, score outputs, and record results as OTel spans.
+Run a task against a dataset, score outputs, and record results as OTel spans (one `test_suite_run` span, one `test_case` span per case) plus one `gen_ai.evaluation.result` event per score.
 
 ```typescript
 import { evaluate } from "opensearch-genai-observability-sdk-ts";
@@ -387,10 +424,13 @@ console.log(result.summary); // { totalCases: 2, errorCount: 0, scores: { accura
 
 Produces:
 ```
-test_suite_run rag-agent
-├── test_case
-└── test_case
+test_suite_run rag-agent        test.suite.name, test.suite.run.id, test.suite.run.status (success | failure)
+├── test_case <case>            test.case.id, test.case.name, test.case.result.status (pass | fail)
+│   └── (event) gen_ai.evaluation.result   + test.suite.name, test.suite.run.id, test.case.id, test.case.name
+└── test_case <case>
 ```
+
+With `recordIo: true`, case input, output and expected values are recorded as `opensearch.test_case.input`, `.output` and `.expected` on the `test_case` span. Errors are recorded as `opensearch.test_case.error` and span status.
 
 **Parameters:**
 
@@ -401,11 +441,11 @@ test_suite_run rag-agent
 | `data` | `Array<{ input, expected?, caseId?, caseName? }>` | Test cases |
 | `scores` | `ScorerFn[]` | Scorer functions: `(input, output, expected)` returning `EvalScore`, `EvalScore[]`, or `number` |
 | `metadata` | `Record<string, unknown>` | Attached to root span. Reserved keys are filtered |
-| `recordIo` | `boolean` | Record input/output/expected as span attributes (default `false`) |
+| `recordIo` | `boolean` | Record input/output/expected as `opensearch.test_case.*` span attributes (default `false`) |
 
 ### `Benchmark`
 
-Upload pre-computed evaluation results from any framework as OTel spans.
+Upload pre-computed evaluation results from any framework. Same span structure as `evaluate()`. Each score is a `gen_ai.evaluation.result` event: parented to the evaluated agent span when `traceId` and `spanId` are given (the `test_case` span also links to it), scored at trace level when only `traceId` is given, and otherwise parented to the `test_case` span.
 
 ```typescript
 import { Benchmark } from "opensearch-genai-observability-sdk-ts";
@@ -487,6 +527,8 @@ const exporter = new AWSSigV4OTLPExporter({
 });
 ```
 
+`AWSSigV4OTLPLogExporter` takes the same options and signs OTLP/JSON log exports (evaluation events). `register()` creates one automatically when `exporter` is an `AWSSigV4OTLPExporter`.
+
 Requires `@aws-sdk/credential-providers` and `aws4` packages.
 
 ## Configuration
@@ -497,6 +539,8 @@ Requires `@aws-sdk/credential-providers` and `aws4` packages.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Base OTLP endpoint URL (`/v1/traces` appended) | — |
 | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | Protocol for traces (`http/protobuf`, `grpc`) | — |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | Protocol for all signals (`http/protobuf`, `grpc`) | — |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Full OTLP/HTTP logs endpoint URL for evaluation events | Derived from the traces endpoint |
+| `OPENSEARCH_GENAI_EVAL_CARRIER` | `span` or `both` selects the deprecated span carrier for `score()` | `event` |
 | `AWS_DEFAULT_REGION` | AWS region for SigV4 signing | — |
 | `AWS_REGION` | AWS region for SigV4 signing (fallback) | — |
 

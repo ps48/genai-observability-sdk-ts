@@ -4,68 +4,76 @@
 /**
  * Example 02: Scoring
  *
- * Demonstrates using score() to evaluate LLM outputs and attach
- * evaluation metadata to traces.
+ * Demonstrates score(), which records each evaluation result as an OTel log
+ * event `gen_ai.evaluation.result` parented to the evaluated span. Events are
+ * exported over OTLP logs (/v1/logs) by the LoggerProvider that register()
+ * sets up, and Data Prepper routes them to the `otel-v1-genai-evaluation` index.
  */
 
-import { score, observe, Op, register } from '../src/index.js';
+import { context } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import { score, withObserve, Op, register } from '../src/index.js';
 
-await register({
+// Propagate the active span across callbacks so inline scores find it.
+context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+
+const provider = await register({
   serviceName: 'scoring-example',
   batch: false,
   autoInstrument: false,
 });
 
-// 1. Simple standalone score
-score({ name: 'accuracy', value: 0.95 });
-
-// 2. Score with label and explanation
-score({
-  name: 'quality',
-  value: 1.0,
-  label: 'excellent',
-  explanation: 'The response was accurate, complete, and well-formatted.',
+// 1. Inline: score the active span while it runs
+const ids = withObserve('answer', { op: Op.CHAT }, (span) => {
+  score({
+    name: 'relevance',
+    value: 0.92,
+    label: 'relevant',
+    explanation: 'The response addresses the question.',
+    evaluator: 'relevance_judge',
+    evaluatorVersion: '1.0.0',
+    evaluatorType: 'llm_judge',
+    direction: 'maximize',
+    scoreMin: 0,
+    scoreMax: 1,
+  });
+  return span.spanContext();
 });
 
-// 3. Score linked to a specific trace
-// In a real app, you'd get the traceId from an observed function
-const traceId = 'abcdef1234567890abcdef1234567890';
-const spanId = 'abcdef1234567890';
-
+// 2. Offline: score a stored span by trace id + span id
 score({
-  name: 'relevance',
-  value: 0.85,
-  traceId,
-  spanId,
+  name: 'faithfulness',
+  value: 0.4,
+  label: 'fail',
+  traceId: ids.traceId,
+  spanId: ids.spanId,
   responseId: 'resp-123',
 });
 
-// 4. Trace-level scoring (no spanId, just traceId)
+// 3. Trace-level: only the trace id is known. The event has no span context and
+//    carries opensearch.evaluation.trace_id + opensearch.evaluation.level=trace.
+score({ name: 'overall-satisfaction', value: 0.9, traceId: ids.traceId });
+
+// 4. Session-scoped human feedback with custom attributes
 score({
-  name: 'overall-satisfaction',
-  value: 0.9,
-  traceId,
+  name: 'user_feedback',
+  value: 1,
+  label: 'thumbs_up',
+  traceId: ids.traceId,
+  spanId: ids.spanId,
+  level: 'session',
+  conversationId: 'conversation-42',
+  evaluatorType: 'human',
+  attributes: { 'feedback.channel': 'web' },
 });
 
-// 5. Score with custom attributes
-score({
-  name: 'latency-score',
-  value: 0.7,
-  attributes: {
-    'eval.method': 'automated',
-    'eval.version': '2.0',
-  },
-});
+// 5. A failed evaluation
+score({ name: 'toxicity', traceId: ids.traceId, spanId: ids.spanId, errorType: 'timeout' });
 
-// 6. Multiple scores for the same trace
-const scores = [
-  { name: 'accuracy', value: 0.95 },
-  { name: 'fluency', value: 0.88 },
-  { name: 'relevance', value: 0.92 },
-];
+// 6. Deprecated: the old span carrier (child span "evaluation <name>"), kept
+//    for one release. Also selectable with OPENSEARCH_GENAI_EVAL_CARRIER=span.
+score({ name: 'legacy', value: 0.5, traceId: ids.traceId, spanId: ids.spanId, carrier: 'span' });
 
-for (const s of scores) {
-  score({ ...s, traceId });
-}
-
-console.log('Scores have been recorded as spans!');
+// Flush traces and evaluation events
+await provider.shutdown();
+console.log('Scores have been recorded as gen_ai.evaluation.result events!');

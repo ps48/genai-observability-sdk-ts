@@ -53,9 +53,11 @@ src/
 ├── observe.ts      # observe() / withObserve() / Op
 ├── enrich.ts       # enrich() — span attribute helpers
 ├── register.ts     # register() — OTel pipeline setup
-├── score.ts        # score() — evaluation spans
+├── score.ts        # score(): gen_ai.evaluation.result log events
+├── logs.ts         # LoggerProvider used by score()
+├── version.ts      # SDK scope name and version
 ├── benchmark.ts    # Benchmark class / evaluate()
-├── exporters.ts    # AWSSigV4OTLPExporter
+├── exporters.ts    # AWSSigV4OTLPExporter, AWSSigV4OTLPLogExporter
 ├── retrieval.ts    # OpenSearchTraceRetriever
 └── internal.ts     # Shared utilities
 tests/
@@ -67,7 +69,8 @@ tests/
 ├── benchmark.test.ts
 ├── exporters.test.ts
 ├── retrieval.test.ts
-└── internal.test.ts
+├── internal.test.ts
+└── version.test.ts
 examples/           # Usage examples
 ```
 

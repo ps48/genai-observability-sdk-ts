@@ -6,12 +6,16 @@
  *
  * Demonstrates using the Benchmark class for manual test case logging
  * and the evaluate() function for automated benchmarking with scorers.
+ *
+ * Each run is a `test_suite_run <suite>` span with one `test_case <case>`
+ * span per case. Each score is a `gen_ai.evaluation.result` log event that
+ * carries test.suite.name, test.suite.run.id, test.case.id and test.case.name.
  */
 
 import { Benchmark, evaluate, register } from '../src/index.js';
 import type { EvalScore } from '../src/index.js';
 
-await register({
+const provider = await register({
   serviceName: 'benchmark-example',
   batch: false,
   autoInstrument: false,
@@ -60,7 +64,8 @@ bench2.log({
   input: 'What is OpenSearch?',
   output: 'OpenSearch is a search and analytics engine.',
   scores: { relevance: 0.9 },
-  // Link to the production trace that generated this output
+  // Score the production span that generated this output: the score event is
+  // parented to that span and the test_case span links to it.
   traceId: 'abcdef1234567890abcdef1234567890',
   spanId: 'abcdef1234567890',
 });
@@ -102,3 +107,6 @@ console.log(`Total cases: ${evalResult.summary.totalCases}`);
 for (const c of evalResult.cases) {
   console.log(`  Case ${c.caseId.slice(0, 8)}: ${c.status} - scores: ${JSON.stringify(c.scores)}`);
 }
+
+// Flush spans and evaluation events
+await provider.shutdown();
