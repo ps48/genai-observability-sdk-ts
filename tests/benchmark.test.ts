@@ -2,9 +2,10 @@
 // Copyright OpenSearch Contributors
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SpanStatusCode } from '@opentelemetry/api';
+import { SpanStatusCode, context } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { Benchmark, evaluate } from '../src/benchmark.js';
-import { getFinishedSpans, clearSpans } from './setup.js';
+import { getFinishedSpans, getFinishedLogRecords, clearSpans } from './setup.js';
 
 beforeEach(() => clearSpans());
 afterEach(() => clearSpans());
@@ -19,7 +20,8 @@ describe('Benchmark class', () => {
     const rootSpan = spans.find(s => s.name.startsWith('test_suite_run'));
     expect(rootSpan).toBeDefined();
     expect(rootSpan!.attributes['test.suite.name']).toBe('test-suite');
-    expect(rootSpan!.attributes['gen_ai.operation.name']).toBe('evaluation');
+    // Benchmark spans are not evaluation results, so no gen_ai.operation.name=evaluation
+    expect(rootSpan!.attributes['gen_ai.operation.name']).toBeUndefined();
     expect(rootSpan!.attributes['test.suite.run.id']).toBeDefined();
     logSpy.mockRestore();
   });
@@ -54,20 +56,84 @@ describe('Benchmark class', () => {
     logSpy.mockRestore();
   });
 
-  it('log records score events on case spans', () => {
+  it('log emits score log events parented to the case span', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const bm = new Benchmark('suite');
     bm.log({
       input: 'q1',
       output: 'a1',
+      caseId: 'case_001',
+      caseName: 'greeting',
       scores: { accuracy: 0.9, fluency: 0.8 },
     });
     bm.close();
 
     const spans = getFinishedSpans();
     const caseSpan = spans.find(s => s.name.startsWith('test_case'))!;
-    const evalEvents = caseSpan.events.filter(e => e.name === 'gen_ai.evaluation.result');
-    expect(evalEvents).toHaveLength(2);
+    expect(caseSpan.name).toBe('test_case greeting');
+    expect(caseSpan.events.filter(e => e.name === 'gen_ai.evaluation.result')).toHaveLength(0);
+
+    const records = getFinishedLogRecords();
+    expect(records).toHaveLength(2);
+    for (const r of records) {
+      expect(r.eventName).toBe('gen_ai.evaluation.result');
+      expect(r.spanContext?.traceId).toBe(caseSpan.spanContext().traceId);
+      expect(r.spanContext?.spanId).toBe(caseSpan.spanContext().spanId);
+      expect(r.attributes['test.suite.name']).toBe('suite');
+      expect(r.attributes['test.suite.run.id']).toBe(bm.runId);
+      expect(r.attributes['test.case.id']).toBe('case_001');
+      expect(r.attributes['test.case.name']).toBe('greeting');
+    }
+    expect(records.map(r => r.attributes['gen_ai.evaluation.name'])).toEqual(['accuracy', 'fluency']);
+    expect(records[0].attributes['gen_ai.evaluation.score.value']).toBe(0.9);
+    logSpy.mockRestore();
+  });
+
+  it('parents score events to the case span without a global context manager', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    context.disable();
+    try {
+      const bm = new Benchmark('suite');
+      bm.log({ input: 'q', scores: { accuracy: 1 } });
+      bm.close();
+    } finally {
+      context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+    }
+    const caseSpan = getFinishedSpans().find(s => s.name.startsWith('test_case'))!;
+    const [record] = getFinishedLogRecords();
+    expect(record.spanContext?.spanId).toBe(caseSpan.spanContext().spanId);
+    logSpy.mockRestore();
+  });
+
+  it('log parents score events to the evaluated span when traceId and spanId given', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const bm = new Benchmark('suite');
+    bm.log({
+      input: 'q',
+      scores: { accuracy: 1 },
+      traceId: 'abcdef1234567890abcdef1234567890',
+      spanId: '1234567890abcdef',
+    });
+    bm.close();
+
+    const [record] = getFinishedLogRecords();
+    expect(record.spanContext?.traceId).toBe('abcdef1234567890abcdef1234567890');
+    expect(record.spanContext?.spanId).toBe('1234567890abcdef');
+    logSpy.mockRestore();
+  });
+
+  it('log with traceId only scores at trace level and creates no link', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const bm = new Benchmark('suite');
+    bm.log({ input: 'q', scores: { accuracy: 1 }, traceId: 'abcdef1234567890abcdef1234567890' });
+    bm.close();
+
+    const caseSpan = getFinishedSpans().find(s => s.name.startsWith('test_case'))!;
+    expect(caseSpan.links).toHaveLength(0);
+    const [record] = getFinishedLogRecords();
+    expect(record.spanContext).toBeUndefined();
+    expect(record.attributes['opensearch.evaluation.trace_id']).toBe('abcdef1234567890abcdef1234567890');
+    expect(record.attributes['opensearch.evaluation.level']).toBe('trace');
     logSpy.mockRestore();
   });
 
@@ -79,9 +145,10 @@ describe('Benchmark class', () => {
 
     const spans = getFinishedSpans();
     const caseSpan = spans.find(s => s.name.startsWith('test_case'))!;
-    expect(caseSpan.attributes['test.case.input']).toBeDefined();
-    expect(caseSpan.attributes['test.case.output']).toBeDefined();
-    expect(caseSpan.attributes['test.case.expected']).toBeDefined();
+    expect(caseSpan.attributes['opensearch.test_case.input']).toBeDefined();
+    expect(caseSpan.attributes['opensearch.test_case.output']).toBeDefined();
+    expect(caseSpan.attributes['opensearch.test_case.expected']).toBeDefined();
+    expect(caseSpan.attributes['test.case.input']).toBeUndefined();
     logSpy.mockRestore();
   });
 
@@ -93,9 +160,9 @@ describe('Benchmark class', () => {
 
     const spans = getFinishedSpans();
     const caseSpan = spans.find(s => s.name.startsWith('test_case'))!;
-    expect(caseSpan.attributes['test.case.input']).toBeUndefined();
-    expect(caseSpan.attributes['test.case.output']).toBeUndefined();
-    expect(caseSpan.attributes['test.case.expected']).toBeUndefined();
+    expect(caseSpan.attributes['opensearch.test_case.input']).toBeUndefined();
+    expect(caseSpan.attributes['opensearch.test_case.output']).toBeUndefined();
+    expect(caseSpan.attributes['opensearch.test_case.expected']).toBeUndefined();
     logSpy.mockRestore();
   });
 
@@ -108,7 +175,7 @@ describe('Benchmark class', () => {
     const spans = getFinishedSpans();
     const caseSpan = spans.find(s => s.name.startsWith('test_case'))!;
     expect(caseSpan.attributes['test.case.result.status']).toBe('fail');
-    expect(caseSpan.attributes['test.case.error']).toBe('something went wrong');
+    expect(caseSpan.attributes['opensearch.test_case.error']).toBe('something went wrong');
     expect(caseSpan.status.code).toBe(SpanStatusCode.ERROR);
     logSpy.mockRestore();
   });
@@ -149,7 +216,7 @@ describe('Benchmark class', () => {
     logSpy.mockRestore();
   });
 
-  it('close sets test.suite.run.status to pass when no errors', () => {
+  it('close sets test.suite.run.status to success when no errors', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const bm = new Benchmark('suite');
     bm.log({ input: 'q', output: 'a' });
@@ -157,11 +224,11 @@ describe('Benchmark class', () => {
 
     const spans = getFinishedSpans();
     const rootSpan = spans.find(s => s.name.startsWith('test_suite_run'))!;
-    expect(rootSpan.attributes['test.suite.run.status']).toBe('pass');
+    expect(rootSpan.attributes['test.suite.run.status']).toBe('success');
     logSpy.mockRestore();
   });
 
-  it('close sets test.suite.run.status to fail when errors exist', () => {
+  it('close sets test.suite.run.status to failure when errors exist', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const bm = new Benchmark('suite');
     bm.log({ input: 'q', error: 'oops' });
@@ -169,7 +236,7 @@ describe('Benchmark class', () => {
 
     const spans = getFinishedSpans();
     const rootSpan = spans.find(s => s.name.startsWith('test_suite_run'))!;
-    expect(rootSpan.attributes['test.suite.run.status']).toBe('fail');
+    expect(rootSpan.attributes['test.suite.run.status']).toBe('failure');
     expect(rootSpan.status.code).toBe(SpanStatusCode.ERROR);
     logSpy.mockRestore();
   });
@@ -380,8 +447,8 @@ describe('evaluate', () => {
 
     const spans = getFinishedSpans();
     const caseSpan = spans.find(s => s.name.startsWith('test_case'))!;
-    expect(caseSpan.attributes['test.case.input']).toBeDefined();
-    expect(caseSpan.attributes['test.case.output']).toBeDefined();
+    expect(caseSpan.attributes['opensearch.test_case.input']).toBeDefined();
+    expect(caseSpan.attributes['opensearch.test_case.output']).toBeDefined();
     logSpy.mockRestore();
   });
 
@@ -397,8 +464,39 @@ describe('evaluate', () => {
 
     const spans = getFinishedSpans();
     const caseSpan = spans.find(s => s.name.startsWith('test_case'))!;
-    expect(caseSpan.attributes['test.case.input']).toBeUndefined();
-    expect(caseSpan.attributes['test.case.output']).toBeUndefined();
+    expect(caseSpan.attributes['opensearch.test_case.input']).toBeUndefined();
+    expect(caseSpan.attributes['opensearch.test_case.output']).toBeUndefined();
+    logSpy.mockRestore();
+  });
+
+  it('emits score log events with label, explanation and suite identity', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const result = evaluate({
+      name: 'events-test',
+      task: (input) => `echo ${input}`,
+      data: [{ input: 'hi', caseId: 'c1', caseName: 'hello case' }],
+      scores: [
+        () => ({ name: 'judge', value: 0.5, label: 'partial', explanation: 'half right', metadata: { 'judge.model': 'm1' } }),
+      ],
+    });
+
+    const caseSpan = getFinishedSpans().find(s => s.name.startsWith('test_case'))!;
+    expect(caseSpan.name).toBe('test_case hello case');
+    const rootSpan = getFinishedSpans().find(s => s.name.startsWith('test_suite_run'))!;
+    expect(rootSpan.attributes['test.suite.run.status']).toBe('success');
+
+    const records = getFinishedLogRecords();
+    expect(records).toHaveLength(1);
+    const r = records[0];
+    expect(r.eventName).toBe('gen_ai.evaluation.result');
+    expect(r.spanContext?.spanId).toBe(caseSpan.spanContext().spanId);
+    expect(r.attributes['gen_ai.evaluation.score.label']).toBe('partial');
+    expect(r.attributes['gen_ai.evaluation.explanation']).toBe('half right');
+    expect(r.attributes['judge.model']).toBe('m1');
+    expect(r.attributes['test.suite.name']).toBe('events-test');
+    expect(r.attributes['test.suite.run.id']).toBe(result.summary.runId);
+    expect(r.attributes['test.case.id']).toBe('c1');
+    expect(r.attributes['test.case.name']).toBe('hello case');
     logSpy.mockRestore();
   });
 });

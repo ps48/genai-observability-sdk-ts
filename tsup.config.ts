@@ -7,6 +7,8 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
+  // Provide import.meta.url in the CJS build (used by createRequire in exporters.ts).
+  shims: true,
   outDir: "dist",
   external: [
     /^@opentelemetry\//,

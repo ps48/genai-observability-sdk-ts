@@ -12,6 +12,10 @@ export const RESERVED_KEYS: ReadonlySet<string> = new Set([
   "test.case.input",
   "test.case.output",
   "test.case.expected",
+  "opensearch.test_case.input",
+  "opensearch.test_case.output",
+  "opensearch.test_case.expected",
+  "opensearch.test_case.error",
   "gen_ai.operation.name",
 ]);
 
@@ -34,4 +38,16 @@ export function validateMetadataKeys(
       );
     }
   }
+}
+
+/** Normalize a hex trace id (optional 0x prefix, left-padded). Returns null if invalid. */
+export function normalizeTraceId(value: string): string | null {
+  const clean = value.replace(/^0[xX]/, "").padStart(32, "0").toLowerCase();
+  return /^[0-9a-f]{32}$/.test(clean) && !/^0+$/.test(clean) ? clean : null;
+}
+
+/** Normalize a hex span id (optional 0x prefix, left-padded). Returns null if invalid. */
+export function normalizeSpanId(value: string): string | null {
+  const clean = value.replace(/^0[xX]/, "").padStart(16, "0").toLowerCase();
+  return /^[0-9a-f]{16}$/.test(clean) && !/^0+$/.test(clean) ? clean : null;
 }

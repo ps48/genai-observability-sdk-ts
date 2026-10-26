@@ -13,7 +13,8 @@ import {
   type Attributes,
 } from '@opentelemetry/api';
 import { createHash, randomUUID } from 'crypto';
-import { RESERVED_KEYS, validateMetadataKeys } from './internal.js';
+import { RESERVED_KEYS, normalizeSpanId, normalizeTraceId, validateMetadataKeys } from './internal.js';
+import { score } from './score.js';
 
 const TRACER_NAME = "opensearch-genai-observability-sdk-ts-benchmarks";
 const IO_TRUNCATION_LIMIT = 10_000;
@@ -121,41 +122,63 @@ function safeMetadata(
 }
 
 function buildSpanLink(traceIdHex?: string, spanIdHex?: string): Link | null {
-  if (!traceIdHex) return null;
-
-  const cleanTraceId = traceIdHex.replace(/^0[xX]/, '').padStart(32, '0').toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(cleanTraceId)) return null;
-
-  let cleanSpanId: string;
-  if (spanIdHex) {
-    cleanSpanId = spanIdHex.replace(/^0[xX]/, '').padStart(16, '0').toLowerCase();
-    if (!/^[0-9a-f]{16}$/.test(cleanSpanId)) return null;
-  } else {
-    cleanSpanId = cleanTraceId.slice(16);
-  }
+  // A link needs a real span id. Never derive one from the trace id.
+  if (!traceIdHex || !spanIdHex) return null;
+  const traceId = normalizeTraceId(traceIdHex);
+  const spanId = normalizeSpanId(spanIdHex);
+  if (!traceId || !spanId) return null;
 
   const spanContext: SpanContext = {
-    traceId: cleanTraceId,
-    spanId: cleanSpanId,
+    traceId,
+    spanId,
     traceFlags: TraceFlags.SAMPLED,
     isRemote: true,
   };
   return { context: spanContext };
 }
 
-function addScoreEvents(span: Span, scores: EvalScore[]): void {
+interface CaseIdentity {
+  suiteName: string;
+  runId: string;
+  caseId: string;
+  caseName?: string;
+}
+
+/**
+ * Emit one gen_ai.evaluation.result event per score. Events are parented to
+ * the evaluated span when traceId + spanId are known, scored at trace level
+ * when only traceId is known, and otherwise parented to the test_case span.
+ * Suite and case identity is copied onto each event.
+ */
+function emitCaseScores(
+  caseSpan: Span,
+  scores: EvalScore[],
+  identity: CaseIdentity,
+  target?: { traceId?: string; spanId?: string },
+): void {
+  // Pass the case span ids explicitly: works without a global context manager.
+  const caseIds = caseSpan.spanContext();
+  const testAttrs: Attributes = {
+    "test.suite.name": identity.suiteName,
+    "test.suite.run.id": identity.runId,
+    "test.case.id": identity.caseId,
+  };
+  if (identity.caseName) testAttrs["test.case.name"] = identity.caseName;
+
   for (const s of scores) {
-    const attrs: Attributes = {
-      "gen_ai.evaluation.name": s.name,
-      "gen_ai.evaluation.score.value": s.value,
+    const metadata = s.metadata ? toAttributes(safeMetadata(s.metadata, `score:${s.name}`)) : {};
+    const options = {
+      name: s.name,
+      value: s.value,
+      label: s.label,
+      explanation: s.explanation,
+      attributes: { ...metadata, ...testAttrs },
     };
-    if (s.label) attrs["gen_ai.evaluation.score.label"] = s.label;
-    if (s.explanation) attrs["gen_ai.evaluation.explanation"] = s.explanation.slice(0, 500);
-    if (s.metadata) {
-      const safe = safeMetadata(s.metadata, `score:${s.name}`);
-      Object.assign(attrs, toAttributes(safe));
+    if (target?.traceId) {
+      score({ ...options, traceId: target.traceId, spanId: target.spanId });
+    } else {
+      score({ ...options, traceId: caseIds.traceId, spanId: caseIds.spanId });
     }
-    span.addEvent("gen_ai.evaluation.result", attrs);
   }
 }
 
@@ -246,10 +269,9 @@ export class Benchmark {
 
     const tracer = trace.getTracer(TRACER_NAME);
     const rootAttrs: Attributes = {
+      ...toAttributes(this._metadata),
       "test.suite.name": name,
       "test.suite.run.id": this._runId,
-      "gen_ai.operation.name": "evaluation",
-      ...toAttributes(this._metadata),
     };
 
     this._rootSpan = tracer.startSpan(`test_suite_run ${name}`, { attributes: rootAttrs });
@@ -290,32 +312,30 @@ export class Benchmark {
 
     const tracer = trace.getTracer(TRACER_NAME);
 
+    const caseMeta = safeMetadata(options.metadata, `case:${caseId}`);
     const spanAttrs: Attributes = {
+      ...toAttributes(caseMeta),
       "test.suite.name": this._name,
       "test.suite.run.id": this._runId,
       "test.case.id": caseId,
       "test.case.result.status": status,
-      "gen_ai.operation.name": "evaluation",
     };
 
     if (options.caseName) spanAttrs["test.case.name"] = options.caseName;
-    if (hasError) spanAttrs["test.case.error"] = options.error;
+    if (hasError) spanAttrs["opensearch.test_case.error"] = options.error;
 
     if (this._recordIo) {
-      if (options.input !== undefined) spanAttrs["test.case.input"] = truncateIo(options.input);
-      if (options.output !== undefined) spanAttrs["test.case.output"] = truncateIo(options.output);
-      if (options.expected !== undefined) spanAttrs["test.case.expected"] = truncateIo(options.expected);
+      if (options.input !== undefined) spanAttrs["opensearch.test_case.input"] = truncateIo(options.input);
+      if (options.output !== undefined) spanAttrs["opensearch.test_case.output"] = truncateIo(options.output);
+      if (options.expected !== undefined) spanAttrs["opensearch.test_case.expected"] = truncateIo(options.expected);
     }
-
-    const caseMeta = safeMetadata(options.metadata, `case:${caseId}`);
-    Object.assign(spanAttrs, toAttributes(caseMeta));
 
     const links: Link[] = [];
     const link = buildSpanLink(options.traceId, options.spanId);
     if (link) links.push(link);
 
     const span = tracer.startSpan(
-      "test_case",
+      `test_case ${options.caseName ?? caseId}`,
       { attributes: spanAttrs, links },
       this._rootContext,
     );
@@ -324,7 +344,12 @@ export class Benchmark {
       const evalScores: EvalScore[] = Object.entries(options.scores).map(
         ([name, value]) => ({ name, value }),
       );
-      addScoreEvents(span, evalScores);
+      emitCaseScores(
+        span,
+        evalScores,
+        { suiteName: this._name, runId: this._runId, caseId, caseName: options.caseName },
+        { traceId: options.traceId, spanId: options.spanId },
+      );
     }
 
     if (hasError) {
@@ -352,7 +377,7 @@ export class Benchmark {
     this._closed = true;
 
     const errorCount = this._cases.filter(c => c.status === 'fail').length;
-    const suiteStatus = errorCount === 0 ? 'pass' : 'fail';
+    const suiteStatus = errorCount === 0 ? 'success' : 'failure';
 
     this._rootSpan.setAttribute("test.suite.run.status", suiteStatus);
     if (errorCount > 0) {
@@ -389,10 +414,9 @@ export function evaluate(options: {
   const tracer = trace.getTracer(TRACER_NAME);
 
   const rootAttrs: Attributes = {
+    ...toAttributes(filteredMetadata),
     "test.suite.name": options.name,
     "test.suite.run.id": runId,
-    "gen_ai.operation.name": "evaluation",
-    ...toAttributes(filteredMetadata),
   };
 
   const rootSpan = tracer.startSpan(`test_suite_run ${options.name}`, { attributes: rootAttrs });
@@ -455,25 +479,24 @@ export function evaluate(options: {
       "test.suite.run.id": runId,
       "test.case.id": caseId,
       "test.case.result.status": caseStatus,
-      "gen_ai.operation.name": "evaluation",
     };
 
     if (caseName) spanAttrs["test.case.name"] = caseName;
-    if (error) spanAttrs["test.case.error"] = error;
+    if (error) spanAttrs["opensearch.test_case.error"] = error;
 
     if (recordIo) {
-      if (item.input !== undefined) spanAttrs["test.case.input"] = truncateIo(item.input);
-      if (output !== undefined) spanAttrs["test.case.output"] = truncateIo(output);
-      if (expected !== undefined) spanAttrs["test.case.expected"] = truncateIo(expected);
+      if (item.input !== undefined) spanAttrs["opensearch.test_case.input"] = truncateIo(item.input);
+      if (output !== undefined) spanAttrs["opensearch.test_case.output"] = truncateIo(output);
+      if (expected !== undefined) spanAttrs["opensearch.test_case.expected"] = truncateIo(expected);
     }
 
     const caseSpan = tracer.startSpan(
-      "test_case",
+      `test_case ${caseName ?? caseId}`,
       { attributes: spanAttrs },
       rootContext,
     );
 
-    addScoreEvents(caseSpan, evalScores);
+    emitCaseScores(caseSpan, evalScores, { suiteName: options.name, runId, caseId, caseName });
 
     if (caseStatus === 'fail') {
       caseSpan.setStatus({ code: SpanStatusCode.ERROR, message: error });
@@ -496,7 +519,7 @@ export function evaluate(options: {
 
   // Finalize root span
   const errorCount = cases.filter(c => c.status === 'fail').length;
-  const suiteStatus = errorCount === 0 ? 'pass' : 'fail';
+  const suiteStatus = errorCount === 0 ? 'success' : 'failure';
   rootSpan.setAttribute("test.suite.run.status", suiteStatus);
   if (errorCount > 0) {
     rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: `${errorCount} case(s) failed` });
