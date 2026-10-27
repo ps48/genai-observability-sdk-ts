@@ -1,9 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright OpenSearch Contributors
 
+/**
+ * Offline evaluation runs: `evaluate()` and `Benchmark`.
+ *
+ * Default shape (no harness spans):
+ *
+ * ```
+ * trace (one per test case)       the agent run, exactly like production
+ *   root span                     + test.suite.name, test.suite.run.id, test.case.id, test.case.name
+ *   LogRecord gen_ai.evaluation.result      one per score, parented to the root span, test.* copied
+ *   LogRecord opensearch.test_case.result   one per case, parented to the root span
+ * LogRecord opensearch.test_suite_run.result   one per run, no trace context
+ * ```
+ *
+ * `traceStructure: true` also creates the older `test_suite_run <suite>` /
+ * `test_case <case>` spans (scores then parent to the case span) and still
+ * emits the case and run events.
+ */
+
 import {
   trace,
   context as otelContext,
+  ROOT_CONTEXT,
   SpanStatusCode,
   TraceFlags,
   type Span,
@@ -12,13 +31,27 @@ import {
   type Link,
   type Attributes,
 } from '@opentelemetry/api';
+import { SeverityNumber } from '@opentelemetry/api-logs';
 import { createHash, randomUUID } from 'crypto';
 import { RESERVED_KEYS, normalizeSpanId, normalizeTraceId, validateMetadataKeys } from './internal.js';
+import { resolveLoggerProvider } from './logs.js';
 import { score } from './score.js';
+import {
+  BENCHMARK_TRACER_NAME,
+  ensureGlobalTestCaseProcessor,
+  runInTestCase,
+  type ActiveTestCase,
+} from './testcase.js';
+import { SDK_SCOPE_NAME, SDK_VERSION } from './version.js';
 
-const TRACER_NAME = "opensearch-genai-observability-sdk-ts-benchmarks";
+const TRACER_NAME = BENCHMARK_TRACER_NAME;
 const IO_TRUNCATION_LIMIT = 10_000;
 const TRUNCATION_MARKER = "...[truncated]";
+
+/** OTel event name of one test case result. */
+export const TEST_CASE_RESULT_EVENT = "opensearch.test_case.result";
+/** OTel event name of one test suite run result. */
+export const TEST_SUITE_RUN_RESULT_EVENT = "opensearch.test_suite_run.result";
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -40,11 +73,18 @@ export interface ScoreSummary {
   count: number;
 }
 
+/** `test.case.result.status` of a case event. */
+export type TestCaseStatus = "pass" | "fail" | "error";
+const CASE_STATUSES: readonly TestCaseStatus[] = ["pass", "fail", "error"];
+
 export interface BenchmarkSummary {
   benchmarkName: string;
   runId: string;
   totalCases: number;
+  /** Cases whose task or a scorer raised (status `error`). */
   errorCount: number;
+  passCount: number;
+  failCount: number;
   durationMs: number;
   scores: Record<string, ScoreSummary>;
 }
@@ -57,7 +97,16 @@ export interface TestCaseResult {
   expected: unknown;
   scores: Record<string, number>;
   error?: string;
+  /** Legacy status: `"pass"`, or `"fail"` when the case errored. */
   status: string;
+  /** `test.case.result.status` emitted on the case event. */
+  resultStatus: TestCaseStatus;
+  /** `error.type` (exception class name) when the case errored. */
+  errorType?: string;
+  durationMs?: number;
+  /** Trace and span id of the agent run's root span, when the task created one. */
+  traceId?: string;
+  spanId?: string;
   scorerErrors?: string[];
 }
 
@@ -121,20 +170,28 @@ function safeMetadata(
   return result;
 }
 
-function buildSpanLink(traceIdHex?: string, spanIdHex?: string): Link | null {
-  // A link needs a real span id. Never derive one from the trace id.
+function errorTypeOf(e: unknown): string {
+  if (e instanceof Error) return e.constructor?.name || e.name || 'Error';
+  return typeof e;
+}
+
+/** Elapsed milliseconds, kept fractional so OTLP encodes it as a double. */
+function elapsedMs(start: number): number {
+  return performance.now() - start;
+}
+
+function spanContextFrom(traceIdHex?: string, spanIdHex?: string): SpanContext | null {
+  // Needs a real span id. Never derive one from the trace id.
   if (!traceIdHex || !spanIdHex) return null;
   const traceId = normalizeTraceId(traceIdHex);
   const spanId = normalizeSpanId(spanIdHex);
   if (!traceId || !spanId) return null;
+  return { traceId, spanId, traceFlags: TraceFlags.SAMPLED, isRemote: true };
+}
 
-  const spanContext: SpanContext = {
-    traceId,
-    spanId,
-    traceFlags: TraceFlags.SAMPLED,
-    isRemote: true,
-  };
-  return { context: spanContext };
+function buildSpanLink(traceIdHex?: string, spanIdHex?: string): Link | null {
+  const spanContext = spanContextFrom(traceIdHex, spanIdHex);
+  return spanContext ? { context: spanContext } : null;
 }
 
 interface CaseIdentity {
@@ -144,27 +201,28 @@ interface CaseIdentity {
   caseName?: string;
 }
 
-/**
- * Emit one gen_ai.evaluation.result event per score. Events are parented to
- * the evaluated span when traceId + spanId are known, scored at trace level
- * when only traceId is known, and otherwise parented to the test_case span.
- * Suite and case identity is copied onto each event.
- */
-function emitCaseScores(
-  caseSpan: Span,
-  scores: EvalScore[],
-  identity: CaseIdentity,
-  target?: { traceId?: string; spanId?: string },
-): void {
-  // Pass the case span ids explicitly: works without a global context manager.
-  const caseIds = caseSpan.spanContext();
-  const testAttrs: Attributes = {
+function identityAttributes(identity: CaseIdentity): Record<string, string> {
+  const attrs: Record<string, string> = {
     "test.suite.name": identity.suiteName,
     "test.suite.run.id": identity.runId,
     "test.case.id": identity.caseId,
   };
-  if (identity.caseName) testAttrs["test.case.name"] = identity.caseName;
+  if (identity.caseName) attrs["test.case.name"] = identity.caseName;
+  return attrs;
+}
 
+/**
+ * Emit one gen_ai.evaluation.result event per score, with the suite and case
+ * identity copied. `target` is the evaluated span (the agent run's root span,
+ * a caller-supplied span, or the opt-in test_case span). With only a trace id
+ * the score is trace-level; with neither the event has no trace context.
+ */
+function emitCaseScores(
+  scores: EvalScore[],
+  identity: CaseIdentity,
+  target: { traceId?: string; spanId?: string },
+): void {
+  const testAttrs = identityAttributes(identity);
   for (const s of scores) {
     const metadata = s.metadata ? toAttributes(safeMetadata(s.metadata, `score:${s.name}`)) : {};
     const options = {
@@ -173,24 +231,74 @@ function emitCaseScores(
       label: s.label,
       explanation: s.explanation,
       attributes: { ...metadata, ...testAttrs },
+      traceId: target.traceId,
+      spanId: target.traceId ? target.spanId : undefined,
     };
-    if (target?.traceId) {
-      score({ ...options, traceId: target.traceId, spanId: target.spanId });
-    } else {
-      score({ ...options, traceId: caseIds.traceId, spanId: caseIds.spanId });
-    }
+    // No target: do not pick up whatever span the caller has active.
+    otelContext.with(ROOT_CONTEXT, () => score(options));
   }
+}
+
+function emitEvent(eventName: string, attributes: Attributes, parent?: SpanContext | null): void {
+  const ctx = parent
+    ? trace.setSpanContext(ROOT_CONTEXT, { ...parent, isRemote: true })
+    : ROOT_CONTEXT;
+  resolveLoggerProvider().getLogger(SDK_SCOPE_NAME, SDK_VERSION).emit({
+    eventName,
+    timestamp: Date.now(),
+    severityNumber: SeverityNumber.INFO,
+    attributes,
+    context: ctx,
+  });
+}
+
+function emitCaseEvent(options: {
+  identity: CaseIdentity;
+  status: TestCaseStatus;
+  errorType?: string;
+  recordIo: boolean;
+  input?: unknown;
+  output?: unknown;
+  expected?: unknown;
+  durationMs?: number;
+  metadata: Attributes;
+  parent?: SpanContext | null;
+}): void {
+  const attrs: Attributes = {
+    ...options.metadata,
+    ...identityAttributes(options.identity),
+    "test.case.result.status": options.status,
+  };
+  if (options.errorType) attrs["error.type"] = options.errorType;
+  if (options.recordIo) {
+    if (options.input !== undefined) attrs["opensearch.test_case.input"] = truncateIo(options.input);
+    if (options.expected !== undefined) attrs["opensearch.test_case.expected"] = truncateIo(options.expected);
+    if (options.output !== undefined) attrs["opensearch.test_case.output"] = truncateIo(options.output);
+  }
+  if (options.durationMs !== undefined) attrs["opensearch.test_case.duration_ms"] = options.durationMs;
+  emitEvent(TEST_CASE_RESULT_EVENT, attrs, options.parent);
+}
+
+function emitRunEvent(summary: BenchmarkSummary, metadata: Attributes): void {
+  emitEvent(TEST_SUITE_RUN_RESULT_EVENT, {
+    ...metadata,
+    "test.suite.name": summary.benchmarkName,
+    "test.suite.run.id": summary.runId,
+    "test.suite.run.status": summary.errorCount === 0 ? 'success' : 'failure',
+    "opensearch.test_suite_run.case_count": summary.totalCases,
+    "opensearch.test_suite_run.pass_count": summary.passCount,
+    "opensearch.test_suite_run.fail_count": summary.failCount,
+    "opensearch.test_suite_run.error_count": summary.errorCount,
+    "opensearch.test_suite_run.duration_ms": summary.durationMs,
+  });
 }
 
 function computeSummary(
   name: string,
   runId: string,
   cases: TestCaseResult[],
-  startTime: number,
+  durationMs: number,
 ): BenchmarkSummary {
-  const errorCount = cases.filter(c => c.status === 'fail').length;
-  const durationMs = Date.now() - startTime;
-
   const scoreAcc: Record<string, { sum: number; min: number; max: number; count: number }> = {};
   for (const c of cases) {
     for (const [scoreName, scoreValue] of Object.entries(c.scores)) {
@@ -221,7 +329,9 @@ function computeSummary(
     benchmarkName: name,
     runId,
     totalCases: cases.length,
-    errorCount,
+    errorCount: cases.filter(c => c.resultStatus === 'error').length,
+    passCount: cases.filter(c => c.resultStatus === 'pass').length,
+    failCount: cases.filter(c => c.resultStatus === 'fail').length,
     durationMs,
     scores,
   };
@@ -232,7 +342,7 @@ function formatSummary(summary: BenchmarkSummary): string {
   lines.push(`Benchmark: ${summary.benchmarkName}`);
   lines.push(`Run ID:    ${summary.runId}`);
   lines.push(`Cases:     ${summary.totalCases} (${summary.errorCount} errors)`);
-  lines.push(`Duration:  ${summary.durationMs}ms`);
+  lines.push(`Duration:  ${Math.round(summary.durationMs)}ms`);
 
   const scoreNames = Object.keys(summary.scores);
   if (scoreNames.length > 0) {
@@ -245,37 +355,87 @@ function formatSummary(summary: BenchmarkSummary): string {
   return lines.join('\n');
 }
 
+/** Opt-in harness span tree (`traceStructure: true`). */
+class SuiteSpans {
+  readonly rootSpan: Span;
+  readonly rootContext: Context;
+
+  constructor(name: string, runId: string, metadata: Attributes) {
+    this.rootSpan = trace.getTracer(TRACER_NAME).startSpan(`test_suite_run ${name}`, {
+      attributes: { ...metadata, "test.suite.name": name, "test.suite.run.id": runId },
+    });
+    this.rootContext = trace.setSpan(otelContext.active(), this.rootSpan);
+  }
+
+  startCase(identity: CaseIdentity, attributes: Attributes, links: Link[] = []): Span {
+    return trace.getTracer(TRACER_NAME).startSpan(
+      `test_case ${identity.caseName ?? identity.caseId}`,
+      { attributes: { ...attributes, ...identityAttributes(identity) }, links },
+      this.rootContext,
+    );
+  }
+
+  end(errorCount: number): void {
+    this.rootSpan.setAttribute("test.suite.run.status", errorCount === 0 ? 'success' : 'failure');
+    if (errorCount > 0) {
+      this.rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: `${errorCount} case(s) failed` });
+    }
+    this.rootSpan.end();
+  }
+}
+
+function finishCaseSpan(
+  span: Span,
+  legacyStatus: string,
+  error: string | undefined,
+  io: { recordIo: boolean; input?: unknown; output?: unknown; expected?: unknown },
+): void {
+  span.setAttribute("test.case.result.status", legacyStatus);
+  if (error) span.setAttribute("opensearch.test_case.error", error);
+  if (io.recordIo) {
+    if (io.input !== undefined) span.setAttribute("opensearch.test_case.input", truncateIo(io.input));
+    if (io.output !== undefined) span.setAttribute("opensearch.test_case.output", truncateIo(io.output));
+    if (io.expected !== undefined) span.setAttribute("opensearch.test_case.expected", truncateIo(io.expected));
+  }
+  if (legacyStatus === 'fail') span.setStatus({ code: SpanStatusCode.ERROR, message: error });
+  span.end();
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark class
 // ---------------------------------------------------------------------------
 
+export interface BenchmarkOptions {
+  metadata?: Record<string, unknown>;
+  recordIo?: boolean;
+  /** Also create `test_suite_run` / `test_case` spans (pre-0.2 shape). Default false. */
+  traceStructure?: boolean;
+}
+
+/**
+ * Upload results of cases you ran yourself. Each `log()` emits score events
+ * and one `opensearch.test_case.result` event, parented to the evaluated span
+ * when `traceId` + `spanId` are given. `close()` emits the run event.
+ */
 export class Benchmark {
   private _name: string;
   private _metadata: Record<string, unknown>;
   private _recordIo: boolean;
   private _runId: string;
-  private _startTime: number;
+  private _start: number;
   private _cases: TestCaseResult[] = [];
   private _closed = false;
-  private _rootSpan: Span;
-  private _rootContext: Context;
+  private _spans?: SuiteSpans;
 
-  constructor(name: string, options?: { metadata?: Record<string, unknown>; recordIo?: boolean }) {
+  constructor(name: string, options?: BenchmarkOptions) {
     this._name = name;
     this._metadata = safeMetadata(options?.metadata, `benchmark:${name}`);
     this._recordIo = options?.recordIo ?? false;
     this._runId = makeRunId();
-    this._startTime = Date.now();
-
-    const tracer = trace.getTracer(TRACER_NAME);
-    const rootAttrs: Attributes = {
-      ...toAttributes(this._metadata),
-      "test.suite.name": name,
-      "test.suite.run.id": this._runId,
-    };
-
-    this._rootSpan = tracer.startSpan(`test_suite_run ${name}`, { attributes: rootAttrs });
-    this._rootContext = trace.setSpan(otelContext.active(), this._rootSpan);
+    this._start = performance.now();
+    if (options?.traceStructure) {
+      this._spans = new SuiteSpans(name, this._runId, toAttributes(this._metadata));
+    }
   }
 
   get name(): string {
@@ -292,11 +452,18 @@ export class Benchmark {
     expected?: unknown;
     scores?: Record<string, number>;
     metadata?: Record<string, unknown>;
+    /** Error message. The case event status becomes `error` (`status` stays `fail`). */
     error?: string;
+    /** `error.type` for an errored case (exception class name or similar). */
+    errorType?: string;
+    /** Explicit case status. Default `error` when `error` or `errorType` is given, else `pass`. */
+    status?: TestCaseStatus;
     caseId?: string;
     caseName?: string;
     traceId?: string;
     spanId?: string;
+    /** `opensearch.test_case.duration_ms`, if you measured it. */
+    durationMs?: number;
   }): void {
     if (this._closed) {
       throw new Error('Benchmark is already closed');
@@ -307,56 +474,63 @@ export class Benchmark {
     }
 
     const caseId = options.caseId ?? makeCaseId(options.input);
-    const hasError = options.error !== undefined;
-    const status = hasError ? 'fail' : 'pass';
-
-    const tracer = trace.getTracer(TRACER_NAME);
-
-    const caseMeta = safeMetadata(options.metadata, `case:${caseId}`);
-    const spanAttrs: Attributes = {
-      ...toAttributes(caseMeta),
-      "test.suite.name": this._name,
-      "test.suite.run.id": this._runId,
-      "test.case.id": caseId,
-      "test.case.result.status": status,
+    const identity: CaseIdentity = {
+      suiteName: this._name,
+      runId: this._runId,
+      caseId,
+      caseName: options.caseName,
     };
-
-    if (options.caseName) spanAttrs["test.case.name"] = options.caseName;
-    if (hasError) spanAttrs["opensearch.test_case.error"] = options.error;
-
-    if (this._recordIo) {
-      if (options.input !== undefined) spanAttrs["opensearch.test_case.input"] = truncateIo(options.input);
-      if (options.output !== undefined) spanAttrs["opensearch.test_case.output"] = truncateIo(options.output);
-      if (options.expected !== undefined) spanAttrs["opensearch.test_case.expected"] = truncateIo(options.expected);
+    if (options.status !== undefined && !CASE_STATUSES.includes(options.status)) {
+      throw new Error(`status must be one of ${CASE_STATUSES.join(', ')}; got "${options.status}"`);
     }
+    const hasError = options.error !== undefined;
+    const resultStatus: TestCaseStatus =
+      options.status ?? (hasError || options.errorType ? 'error' : 'pass');
+    const legacyStatus = options.status ?? (hasError ? 'fail' : 'pass');
+    const errorType = options.errorType;
+    const caseMeta = toAttributes(safeMetadata(options.metadata, `case:${caseId}`));
+    const evaluated = spanContextFrom(options.traceId, options.spanId);
 
-    const links: Link[] = [];
-    const link = buildSpanLink(options.traceId, options.spanId);
-    if (link) links.push(link);
-
-    const span = tracer.startSpan(
-      `test_case ${options.caseName ?? caseId}`,
-      { attributes: spanAttrs, links },
-      this._rootContext,
-    );
+    let caseSpan: Span | undefined;
+    if (this._spans) {
+      const links: Link[] = [];
+      const link = buildSpanLink(options.traceId, options.spanId);
+      if (link) links.push(link);
+      caseSpan = this._spans.startCase(identity, caseMeta, links);
+    }
 
     if (options.scores) {
       const evalScores: EvalScore[] = Object.entries(options.scores).map(
         ([name, value]) => ({ name, value }),
       );
-      emitCaseScores(
-        span,
-        evalScores,
-        { suiteName: this._name, runId: this._runId, caseId, caseName: options.caseName },
-        { traceId: options.traceId, spanId: options.spanId },
-      );
+      const caseIds = caseSpan?.spanContext();
+      const target = options.traceId
+        ? { traceId: options.traceId, spanId: options.spanId }
+        : { traceId: caseIds?.traceId, spanId: caseIds?.spanId };
+      emitCaseScores(evalScores, identity, target);
     }
 
-    if (hasError) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: options.error });
+    if (caseSpan) {
+      finishCaseSpan(caseSpan, legacyStatus, options.error, {
+        recordIo: this._recordIo,
+        input: options.input,
+        output: options.output,
+        expected: options.expected,
+      });
     }
 
-    span.end();
+    emitCaseEvent({
+      identity,
+      status: resultStatus,
+      errorType,
+      recordIo: this._recordIo,
+      input: options.input,
+      output: options.output,
+      expected: options.expected,
+      durationMs: options.durationMs,
+      metadata: { ...toAttributes(this._metadata), ...caseMeta },
+      parent: evaluated ?? caseSpan?.spanContext(),
+    });
 
     this._cases.push({
       caseId,
@@ -366,7 +540,12 @@ export class Benchmark {
       expected: options.expected,
       scores: options.scores ?? {},
       error: options.error,
-      status,
+      status: legacyStatus,
+      resultStatus,
+      errorType,
+      durationMs: options.durationMs,
+      traceId: evaluated?.traceId,
+      spanId: evaluated?.spanId,
     });
   }
 
@@ -376,16 +555,9 @@ export class Benchmark {
     }
     this._closed = true;
 
-    const errorCount = this._cases.filter(c => c.status === 'fail').length;
-    const suiteStatus = errorCount === 0 ? 'success' : 'failure';
-
-    this._rootSpan.setAttribute("test.suite.run.status", suiteStatus);
-    if (errorCount > 0) {
-      this._rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: `${errorCount} case(s) failed` });
-    }
-    this._rootSpan.end();
-
-    const summary = computeSummary(this._name, this._runId, this._cases, this._startTime);
+    const summary = computeSummary(this._name, this._runId, this._cases, elapsedMs(this._start));
+    this._spans?.end(summary.errorCount);
+    emitRunEvent(summary, toAttributes(this._metadata));
     console.log(formatSummary(summary));
     return summary;
   }
@@ -397,47 +569,70 @@ export class Benchmark {
 
 type ScorerFn = (input: unknown, output: unknown, expected: unknown) => EvalScore | EvalScore[] | number;
 
-export function evaluate(options: {
+export interface EvaluateOptions {
   name: string;
   task: (input: unknown) => unknown;
   data: Array<{ input: unknown; expected?: unknown; caseId?: string; caseName?: string }>;
   scores: ScorerFn[];
   metadata?: Record<string, unknown>;
   recordIo?: boolean;
-}): BenchmarkResult {
-  const filteredMetadata = safeMetadata(options.metadata, `evaluate:${options.name}`);
+  /**
+   * Also create `test_suite_run` / `test_case` spans (pre-0.2 shape). The task
+   * runs inside the case span and scores parent to it. Case and run events
+   * are still emitted. Default false.
+   */
+  traceStructure?: boolean;
+}
+
+/**
+ * Run `task` on each data item, score it and record the run.
+ *
+ * Cases run one at a time and `task` must be synchronous. While a case runs,
+ * the SDK's TestCaseSpanProcessor stamps `test.*` ids on the root span(s) the
+ * task starts and remembers the first one, so score events and the case event
+ * are parented to the agent run's own trace. The TypeScript SDK has no default
+ * context manager, so this uses a module-level "current case" instead of the
+ * active OTel context.
+ */
+export function evaluate(options: EvaluateOptions): BenchmarkResult {
+  const filteredMetadata = toAttributes(safeMetadata(options.metadata, `evaluate:${options.name}`));
   const recordIo = options.recordIo ?? false;
   const runId = makeRunId();
-  const startTime = Date.now();
+  const runStart = performance.now();
   const cases: TestCaseResult[] = [];
 
-  const tracer = trace.getTracer(TRACER_NAME);
-
-  const rootAttrs: Attributes = {
-    ...toAttributes(filteredMetadata),
-    "test.suite.name": options.name,
-    "test.suite.run.id": runId,
-  };
-
-  const rootSpan = tracer.startSpan(`test_suite_run ${options.name}`, { attributes: rootAttrs });
-  const rootContext = trace.setSpan(otelContext.active(), rootSpan);
+  ensureGlobalTestCaseProcessor();
+  const spans = options.traceStructure
+    ? new SuiteSpans(options.name, runId, filteredMetadata)
+    : undefined;
 
   for (const item of options.data) {
-    const caseId = item.caseId ?? makeCaseId(item.input);
-    const caseName = item.caseName;
+    const caseStart = performance.now();
+    const identity: CaseIdentity = {
+      suiteName: options.name,
+      runId,
+      caseId: item.caseId ?? makeCaseId(item.input),
+      caseName: item.caseName,
+    };
     const expected = item.expected;
 
     let output: unknown;
     let error: string | undefined;
-    let caseStatus = 'pass';
+    let errorType: string | undefined;
     const caseScores: Record<string, number> = {};
     const evalScores: EvalScore[] = [];
     const scorerErrors: string[] = [];
 
+    const caseSpan = spans?.startCase(identity, {});
+    // Default: the agent run is its own trace. traceStructure: inside the case span.
+    const taskContext = caseSpan ? trace.setSpan(otelContext.active(), caseSpan) : ROOT_CONTEXT;
+    const active: ActiveTestCase = { attributes: identityAttributes(identity), seen: new Set() };
+
     // Run task
     try {
-      output = options.task(item.input);
+      output = runInTestCase(active, () => otelContext.with(taskContext, () => options.task(item.input)));
       if (output instanceof Promise) {
+        output.catch(() => {});
         throw new Error(
           "evaluate() does not support async task functions. " +
           "The task returned a Promise — use a synchronous task or await the async call inside a sync wrapper."
@@ -445,11 +640,11 @@ export function evaluate(options: {
       }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
-      caseStatus = 'fail';
+      errorType = errorTypeOf(e);
     }
 
-    // Run scorers
-    if (caseStatus !== 'fail') {
+    // Run scorers (outside the case: judge spans are not the agent run)
+    if (error === undefined) {
       for (const scorer of options.scores) {
         try {
           const result = scorer(item.input, output, expected);
@@ -470,63 +665,63 @@ export function evaluate(options: {
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           scorerErrors.push(msg);
+          errorType ??= errorTypeOf(e);
         }
       }
     }
 
-    const spanAttrs: Attributes = {
-      "test.suite.name": options.name,
-      "test.suite.run.id": runId,
-      "test.case.id": caseId,
-      "test.case.result.status": caseStatus,
-    };
+    const resultStatus: TestCaseStatus = errorType ? 'error' : 'pass';
+    const legacyStatus = resultStatus === 'error' ? 'fail' : 'pass';
+    const root = active.root;
+    const caseIds = caseSpan?.spanContext();
 
-    if (caseName) spanAttrs["test.case.name"] = caseName;
-    if (error) spanAttrs["opensearch.test_case.error"] = error;
+    const scoreTarget = caseIds ?? root;
+    emitCaseScores(evalScores, identity, { traceId: scoreTarget?.traceId, spanId: scoreTarget?.spanId });
 
-    if (recordIo) {
-      if (item.input !== undefined) spanAttrs["opensearch.test_case.input"] = truncateIo(item.input);
-      if (output !== undefined) spanAttrs["opensearch.test_case.output"] = truncateIo(output);
-      if (expected !== undefined) spanAttrs["opensearch.test_case.expected"] = truncateIo(expected);
+    if (caseSpan) {
+      finishCaseSpan(caseSpan, legacyStatus, error ?? scorerErrors[0], {
+        recordIo,
+        input: item.input,
+        output,
+        expected,
+      });
     }
 
-    const caseSpan = tracer.startSpan(
-      `test_case ${caseName ?? caseId}`,
-      { attributes: spanAttrs },
-      rootContext,
-    );
-
-    emitCaseScores(caseSpan, evalScores, { suiteName: options.name, runId, caseId, caseName });
-
-    if (caseStatus === 'fail') {
-      caseSpan.setStatus({ code: SpanStatusCode.ERROR, message: error });
-    }
-
-    caseSpan.end();
+    const durationMs = elapsedMs(caseStart);
+    emitCaseEvent({
+      identity,
+      status: resultStatus,
+      errorType,
+      recordIo,
+      input: item.input,
+      output,
+      expected,
+      durationMs,
+      metadata: filteredMetadata,
+      parent: root ?? caseIds,
+    });
 
     cases.push({
-      caseId,
-      caseName,
+      caseId: identity.caseId,
+      caseName: identity.caseName,
       input: item.input,
       output,
       expected,
       scores: caseScores,
       error,
-      status: caseStatus,
+      status: legacyStatus,
+      resultStatus,
+      errorType,
+      durationMs,
+      traceId: root?.traceId,
+      spanId: root?.spanId,
       scorerErrors: scorerErrors.length > 0 ? scorerErrors : undefined,
     });
   }
 
-  // Finalize root span
-  const errorCount = cases.filter(c => c.status === 'fail').length;
-  const suiteStatus = errorCount === 0 ? 'success' : 'failure';
-  rootSpan.setAttribute("test.suite.run.status", suiteStatus);
-  if (errorCount > 0) {
-    rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: `${errorCount} case(s) failed` });
-  }
-  rootSpan.end();
-
-  const summary = computeSummary(options.name, runId, cases, startTime);
+  const summary = computeSummary(options.name, runId, cases, elapsedMs(runStart));
+  spans?.end(summary.errorCount);
+  emitRunEvent(summary, filteredMetadata);
   console.log(formatSummary(summary));
 
   return { summary, cases };

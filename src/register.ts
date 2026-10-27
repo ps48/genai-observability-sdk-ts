@@ -17,6 +17,7 @@ import {
   type LoggerProviderConfig,
 } from "@opentelemetry/sdk-logs";
 import { AWSSigV4OTLPExporter, AWSSigV4OTLPLogExporter } from "./exporters.js";
+import { installTestCaseProcessor } from "./testcase.js";
 import { hasGlobalLoggerProvider, getSdkLoggerProvider, setSdkLoggerProvider } from "./logs.js";
 
 export const DEFAULT_ENDPOINT =
@@ -297,6 +298,8 @@ export async function register(
     options.batch === false
       ? new SimpleSpanProcessor(exporter)
       : new BatchSpanProcessor(exporter);
+  // Stamps test.* ids on agent root spans while evaluate() runs a test case.
+  installTestCaseProcessor(provider);
   provider.addSpanProcessor(processor);
 
   const setGlobal = options.setGlobal ?? true;

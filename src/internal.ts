@@ -16,6 +16,13 @@ export const RESERVED_KEYS: ReadonlySet<string> = new Set([
   "opensearch.test_case.output",
   "opensearch.test_case.expected",
   "opensearch.test_case.error",
+  "opensearch.test_case.duration_ms",
+  "opensearch.test_suite_run.case_count",
+  "opensearch.test_suite_run.pass_count",
+  "opensearch.test_suite_run.fail_count",
+  "opensearch.test_suite_run.error_count",
+  "opensearch.test_suite_run.duration_ms",
+  "error.type",
   "gen_ai.operation.name",
 ]);
 
