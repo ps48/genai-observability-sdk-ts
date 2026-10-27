@@ -15,7 +15,7 @@ OTel-native tracing and scoring for LLM applications. Instrument your AI workflo
 - **`markAgentRoot()`** — mark the agent's span as the trace's agent root in OpenSearch Agent Traces
 - **Auto-instrumentation** — automatically discovers and activates installed instrumentor packages (OpenAI, etc.)
 - **Scoring**: `score()` emits each evaluation result as an OTel `gen_ai.evaluation.result` log event, parented to the evaluated span
-- **Benchmarks** — `evaluate()` runs your agent against a dataset with scorers; `Benchmark` uploads results from any eval framework
+- **Benchmarks**: `evaluate()` runs your agent against a dataset with scorers; `Benchmark` uploads results from any eval framework. Each case is its own agent trace plus `opensearch.test_case.result` and `opensearch.test_suite_run.result` log events
 - **AWS SigV4** — built-in SigV4 signing for AWS-hosted OpenSearch and Data Prepper endpoints
 - **Streaming** — full support for sync/async functions, generators, and async generators
 - **Zero lock-in** — remove a wrapper and your code still works; everything is standard OTel
@@ -99,11 +99,12 @@ invoke_agent research_agent
 │  ┌──────────────────────────────────────────────┐    │
 │  │  TracerProvider                               │    │
 │  │  ├── Resource (service.name)                  │    │
+│  │  ├── TestCaseSpanProcessor (evaluate())       │    │
 │  │  ├── BatchSpanProcessor                       │    │
 │  │  │   └── OTLPSpanExporter (HTTP or gRPC)      │    │
 │  │  │       └── SigV4 signing (AWS endpoints)    │    │
 │  │  └── Auto-instrumentation                     │    │
-│  │  LoggerProvider (evaluation events)           │    │
+│  │  LoggerProvider (evaluation and test events)  │    │
 │  │  └── BatchLogRecordProcessor                  │    │
 │  │      └── OTLPLogExporter (HTTP, /v1/logs)     │    │
 │  └──────────────────────────────────────────────┘    │
@@ -394,7 +395,7 @@ The instrumentation scope of the event is the evaluator (`evaluator` / `evaluato
 
 ### `evaluate()`
 
-Run a task against a dataset, score outputs, and record results as OTel spans (one `test_suite_run` span, one `test_case` span per case) plus one `gen_ai.evaluation.result` event per score.
+Run a task against a dataset, score outputs, and record the run as OTel log events. By default no `test_suite_run` / `test_case` spans are created: each case's agent run is its own trace, exactly like production.
 
 ```typescript
 import { evaluate } from "opensearch-genai-observability-sdk-ts";
@@ -419,33 +420,63 @@ const result = evaluate({
   recordIo: true,
 });
 
-console.log(result.summary); // { totalCases: 2, errorCount: 0, scores: { accuracy: { avg: 1.0 } } }
+console.log(result.summary); // { totalCases: 2, passCount: 2, errorCount: 0, scores: { accuracy: { avg: 1.0 } } }
 ```
 
 Produces:
 ```
+trace (one per case)                        the agent run, unchanged
+└── root span                               + test.suite.name, test.suite.run.id, test.case.id, test.case.name
+    (event) gen_ai.evaluation.result        one per score, parented to the root span, test.* ids copied
+    (event) opensearch.test_case.result     one per case, parented to the root span
+(event) opensearch.test_suite_run.result    one per run, no trace context
+```
+
+`opensearch.test_case.result` attributes: `test.suite.name`, `test.suite.run.id`, `test.case.id`, `test.case.name`, `test.case.result.status` (`pass` | `fail` | `error`), `error.type` (exception class name, when the task or a scorer threw), `opensearch.test_case.duration_ms`, run `metadata`, and with `recordIo: true` the truncated `opensearch.test_case.input`, `.expected` and `.output`.
+
+`opensearch.test_suite_run.result` attributes: `test.suite.name`, `test.suite.run.id`, `test.suite.run.status` (`success` when no case errored, else `failure`), `opensearch.test_suite_run.case_count`, `.pass_count`, `.fail_count`, `.error_count`, `.duration_ms`, and run `metadata`.
+
+A case whose task throws still gets its case event (status `error`) and the run continues. When the task creates no span, the case and score events have no trace context. All events go to the OTLP logs endpoint; Data Prepper routes them to `otel-v1-genai-evaluation-*`, distinguished by `eventName`.
+
+**How root spans are found.** The TypeScript SDK installs no context manager, so `evaluate()` cannot rely on the active OTel context. Cases run one at a time and `task` is synchronous, so the SDK keeps a module-level "current case" while each task runs. `TestCaseSpanProcessor` reads it in `onStart`: every span started during the case without a parent from the same case (no parent, or a remote parent) is stamped with the `test.*` ids, and the first one becomes the trace context for that case's events. Spans started by scorers (LLM judges) are outside the case and are not stamped. `register()` adds the processor to its provider, and `evaluate()` adds it to a global OTel JS 1.x `BasicTracerProvider` if missing. With a provider that only takes processors at construction (OTel JS 2.x), add it yourself:
+
+```typescript
+import { TestCaseSpanProcessor } from "opensearch-genai-observability-sdk-ts";
+
+const provider = new BasicTracerProvider({
+  spanProcessors: [new TestCaseSpanProcessor(), new BatchSpanProcessor(exporter)],
+});
+```
+
+**`traceStructure: true`** restores the earlier span tree (and still emits the case and run events). The task runs inside the `test_case` span, scores are parented to the `test_case` span, and the case event is parented to the agent's root span (or the `test_case` span if the task created none):
+
+```
 test_suite_run rag-agent        test.suite.name, test.suite.run.id, test.suite.run.status (success | failure)
 ├── test_case <case>            test.case.id, test.case.name, test.case.result.status (pass | fail)
-│   └── (event) gen_ai.evaluation.result   + test.suite.name, test.suite.run.id, test.case.id, test.case.name
+│   ├── invoke_agent ...        the task's spans
+│   └── (event) gen_ai.evaluation.result
 └── test_case <case>
 ```
 
-With `recordIo: true`, case input, output and expected values are recorded as `opensearch.test_case.input`, `.output` and `.expected` on the `test_case` span. Errors are recorded as `opensearch.test_case.error` and span status.
+With `traceStructure: true` and `recordIo: true`, input, output and expected are also set on the `test_case` span, and errors as `opensearch.test_case.error` and span status.
 
 **Parameters:**
 
 | Parameter | Type | Description |
 |---|---|---|
 | `name` | `string` | Benchmark name (`test.suite.name`). Stable across runs |
-| `task` | `(input: unknown) => unknown` | Function that takes input and returns output |
+| `task` | `(input: unknown) => unknown` | Synchronous function that takes input and returns output |
 | `data` | `Array<{ input, expected?, caseId?, caseName? }>` | Test cases |
 | `scores` | `ScorerFn[]` | Scorer functions: `(input, output, expected)` returning `EvalScore`, `EvalScore[]`, or `number` |
-| `metadata` | `Record<string, unknown>` | Attached to root span. Reserved keys are filtered |
-| `recordIo` | `boolean` | Record input/output/expected as `opensearch.test_case.*` span attributes (default `false`) |
+| `metadata` | `Record<string, unknown>` | Copied to the case and run events (and the root span with `traceStructure`). Reserved keys are filtered |
+| `recordIo` | `boolean` | Record input/expected/output as `opensearch.test_case.*` on the case event (default `false`) |
+| `traceStructure` | `boolean` | Also create `test_suite_run` / `test_case` spans (default `false`) |
+
+Each `TestCaseResult` has `status` (`pass`, or `fail` when the case errored, as before), `resultStatus` (`pass` | `fail` | `error`, as emitted), `errorType`, `durationMs`, and the `traceId` / `spanId` of the agent root span when the task created one.
 
 ### `Benchmark`
 
-Upload pre-computed evaluation results from any framework. Same span structure as `evaluate()`. Each score is a `gen_ai.evaluation.result` event: parented to the evaluated agent span when `traceId` and `spanId` are given (the `test_case` span also links to it), scored at trace level when only `traceId` is given, and otherwise parented to the `test_case` span.
+Upload pre-computed evaluation results from any framework. Each `log()` emits one `gen_ai.evaluation.result` event per score and one `opensearch.test_case.result` event, both parented to the evaluated agent span when `traceId` and `spanId` are given. With only `traceId`, scores are trace-level and the case event has no trace context; with neither, no event has trace context. `error` or `errorType` marks the case `error` (`error.type` from `errorType`); `status` sets `pass`, `fail` or `error` explicitly. `close()` emits the `opensearch.test_suite_run.result` event. Pass `traceStructure: true` to also create the `test_suite_run` / `test_case` spans (the `test_case` span links to the evaluated span, and scores without ids are parented to it).
 
 ```typescript
 import { Benchmark } from "opensearch-genai-observability-sdk-ts";
@@ -468,6 +499,7 @@ bench.log({
   scores: { accuracy: 0.9 },
   traceId: "6ebb9835f43af1552f2cebb9f5165e39",
   spanId: "89829115c2128845",
+  durationMs: 840,
 });
 
 const summary = bench.close();

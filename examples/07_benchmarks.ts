@@ -7,12 +7,15 @@
  * Demonstrates using the Benchmark class for manual test case logging
  * and the evaluate() function for automated benchmarking with scorers.
  *
- * Each run is a `test_suite_run <suite>` span with one `test_case <case>`
- * span per case. Each score is a `gen_ai.evaluation.result` log event that
- * carries test.suite.name, test.suite.run.id, test.case.id and test.case.name.
+ * Each case's agent run is its own trace; its root span is stamped with
+ * test.suite.name, test.suite.run.id, test.case.id and test.case.name. Each
+ * score is a `gen_ai.evaluation.result` log event parented to that root span,
+ * each case is one `opensearch.test_case.result` event and each run one
+ * `opensearch.test_suite_run.result` event. Pass `traceStructure: true` to
+ * also get the older `test_suite_run` / `test_case` spans.
  */
 
-import { Benchmark, evaluate, register } from '../src/index.js';
+import { Benchmark, Op, evaluate, register, withObserve } from '../src/index.js';
 import type { EvalScore } from '../src/index.js';
 
 const provider = await register({
@@ -64,10 +67,11 @@ bench2.log({
   input: 'What is OpenSearch?',
   output: 'OpenSearch is a search and analytics engine.',
   scores: { relevance: 0.9 },
-  // Score the production span that generated this output: the score event is
-  // parented to that span and the test_case span links to it.
+  // The production span that generated this output: the score and case
+  // events are parented to it.
   traceId: 'abcdef1234567890abcdef1234567890',
   spanId: 'abcdef1234567890',
+  durationMs: 840,
 });
 
 bench2.close();
@@ -88,11 +92,13 @@ function matchScore(_input: unknown, output: unknown, expected: unknown): number
 
 const evalResult = evaluate({
   name: 'qa-benchmark',
-  task: (input) => {
-    const q = (input as { question: string }).question;
-    // Simulated LLM response
-    return `The answer to "${q}" is based on available knowledge.`;
-  },
+  // The task's root span (invoke_agent qa-agent) gets the test.* ids.
+  task: (input) =>
+    withObserve('qa-agent', { op: Op.INVOKE_AGENT }, () => {
+      const q = (input as { question: string }).question;
+      // Simulated LLM response
+      return `The answer to "${q}" is based on available knowledge.`;
+    }),
   data: [
     { input: { question: 'What is AI?' }, expected: 'AI is artificial intelligence.' },
     { input: { question: 'What is ML?' }, expected: 'ML is machine learning.' },
@@ -105,7 +111,9 @@ const evalResult = evaluate({
 console.log(`\nAutomated Evaluation: ${evalResult.summary.benchmarkName}`);
 console.log(`Total cases: ${evalResult.summary.totalCases}`);
 for (const c of evalResult.cases) {
-  console.log(`  Case ${c.caseId.slice(0, 8)}: ${c.status} - scores: ${JSON.stringify(c.scores)}`);
+  console.log(
+    `  Case ${c.caseId.slice(0, 8)}: ${c.resultStatus} trace=${c.traceId} scores=${JSON.stringify(c.scores)}`,
+  );
 }
 
 // Flush spans and evaluation events
