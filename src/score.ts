@@ -11,27 +11,12 @@ import {
 } from '@opentelemetry/api';
 import { SeverityNumber } from '@opentelemetry/api-logs';
 import { normalizeSpanId, normalizeTraceId } from './internal.js';
-import { resolveLoggerProvider } from './logs.js';
-import { SDK_SCOPE_NAME, SDK_VERSION } from './version.js';
+import { getEventLogger } from './logs.js';
 
 /** OTel event name of an evaluation result (semantic-conventions-genai). */
 export const EVALUATION_RESULT_EVENT = "gen_ai.evaluation.result";
 
-/** Env var that selects the carrier when `carrier` is not passed. */
-export const EVAL_CARRIER_ENV = "OPENSEARCH_GENAI_EVAL_CARRIER";
-
-/** Tracer name of the deprecated span carrier. */
-const TRACER_NAME = "opensearch-genai-observability-sdk-ts-scores";
 const EXPLANATION_LIMIT = 500;
-
-/**
- * Where an evaluation result is written.
- *
- * - `"event"` (default): one OTel log event `gen_ai.evaluation.result`.
- * - `"span"` (deprecated): a child span `evaluation <name>` with a span event.
- * - `"both"`: emit both, for migrating dashboards.
- */
-export type EvaluationCarrier = "event" | "span" | "both";
 
 export type EvaluationLevel = "span" | "trace" | "session" | "tool_call";
 export type EvaluatorType = "llm_judge" | "code" | "human" | "external";
@@ -40,7 +25,10 @@ export type ScoreDirection = "maximize" | "minimize";
 export interface ScoreOptions {
   /** `gen_ai.evaluation.name` (required), for example `"relevance"`. */
   name: string;
-  /** `gen_ai.evaluation.score.value`. */
+  /**
+   * `gen_ai.evaluation.score.value` (a double in OTel semconv). The SDK's OTLP
+   * log exporters send whole numbers as `doubleValue` too; see README.
+   */
   value?: number;
   /** Trace of the evaluated span. Without `spanId` the score is trace-level. */
   traceId?: string;
@@ -54,9 +42,13 @@ export interface ScoreOptions {
   responseId?: string;
   /** `opensearch.evaluation.level`. Defaults to `"trace"` for trace-level scores. */
   level?: EvaluationLevel;
-  /** Evaluator identity: instrumentation scope name and `opensearch.evaluation.evaluator.name`. */
+  /**
+   * Evaluator identity: instrumentation scope name of the event and
+   * `opensearch.evaluation.evaluator.name`. Without it the scope is the SDK
+   * scope (`opensearch-genai-observability-sdk-ts` + SDK version).
+   */
   evaluator?: string;
-  /** Instrumentation scope version and `opensearch.evaluation.evaluator.version`. */
+  /** Instrumentation scope version (with `evaluator`) and `opensearch.evaluation.evaluator.version`. */
   evaluatorVersion?: string;
   /** `opensearch.evaluation.evaluator.type`. */
   evaluatorType?: EvaluatorType;
@@ -74,33 +66,8 @@ export interface ScoreOptions {
   errorType?: string;
   /** `opensearch.evaluation.judge.trace_id`: the judge's own trace. */
   judgeTraceId?: string;
-  /** Carrier. Defaults to env `OPENSEARCH_GENAI_EVAL_CARRIER`, else `"event"`. */
-  carrier?: EvaluationCarrier;
   /** Extra attributes (string, number, boolean). Explicit options take precedence. */
   attributes?: Record<string, unknown>;
-}
-
-let spanCarrierWarned = false;
-
-/** @internal Reset the one-time deprecation warning (tests only). */
-export function _resetScoreWarnings(): void {
-  spanCarrierWarned = false;
-}
-
-function resolveCarrier(carrier?: EvaluationCarrier): EvaluationCarrier {
-  const value = carrier ?? process.env[EVAL_CARRIER_ENV]?.trim().toLowerCase();
-  if (value === "span" || value === "both") return value;
-  return "event";
-}
-
-function warnSpanCarrier(): void {
-  if (spanCarrierWarned) return;
-  spanCarrierWarned = true;
-  console.warn(
-    `[opensearch-genai-observability-sdk-ts] score() span carrier is deprecated and will be ` +
-      `removed in a future release. Evaluation results are now emitted as OTel log events ` +
-      `"${EVALUATION_RESULT_EVENT}". Remove carrier: "span" / ${EVAL_CARRIER_ENV}=span.`,
-  );
 }
 
 interface Target {
@@ -183,9 +150,11 @@ function buildAttributes(options: ScoreOptions, target: Target): Attributes {
 
 function emitEvent(options: ScoreOptions, target: Target, attributes: Attributes): void {
   // Evaluator identity goes in the instrumentation scope (standard mechanism).
+  // The scope is always set: the evaluator, else the SDK scope and version.
+  // Scope attributes opensearch.genai.sdk.name / .version are always set.
   const logger = options.evaluator
-    ? resolveLoggerProvider().getLogger(options.evaluator, options.evaluatorVersion)
-    : resolveLoggerProvider().getLogger(SDK_SCOPE_NAME, SDK_VERSION);
+    ? getEventLogger(options.evaluator, options.evaluatorVersion)
+    : getEventLogger();
   logger.emit({
     eventName: EVALUATION_RESULT_EVENT,
     timestamp: Date.now(),
@@ -193,18 +162,6 @@ function emitEvent(options: ScoreOptions, target: Target, attributes: Attributes
     attributes,
     context: target.context,
   });
-}
-
-/** Deprecated carrier: a child span of the evaluated span carrying the result. */
-function emitSpan(options: ScoreOptions, target: Target, attributes: Attributes): void {
-  const tracer = trace.getTracer(TRACER_NAME);
-  const span = tracer.startSpan(
-    `evaluation ${options.name}`,
-    { attributes: { ...attributes, "gen_ai.operation.name": "evaluation" } },
-    target.context,
-  );
-  span.addEvent(EVALUATION_RESULT_EVENT, attributes);
-  span.end();
 }
 
 /**
@@ -217,15 +174,6 @@ function emitSpan(options: ScoreOptions, target: Target, attributes: Attributes)
  *   `opensearch.evaluation.trace_id` and `opensearch.evaluation.level=trace`.
  */
 export function score(options: ScoreOptions): void {
-  const carrier = resolveCarrier(options.carrier);
   const target = resolveTarget(options.traceId, options.spanId);
-  const attributes = buildAttributes(options, target);
-
-  if (carrier === "event" || carrier === "both") {
-    emitEvent(options, target, attributes);
-  }
-  if (carrier === "span" || carrier === "both") {
-    warnSpanCarrier();
-    emitSpan(options, target, attributes);
-  }
+  emitEvent(options, target, buildAttributes(options, target));
 }

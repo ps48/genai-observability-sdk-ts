@@ -11,8 +11,7 @@
  * test.suite.name, test.suite.run.id, test.case.id and test.case.name. Each
  * score is a `gen_ai.evaluation.result` log event parented to that root span,
  * each case is one `opensearch.test_case.result` event and each run one
- * `opensearch.test_suite_run.result` event. Pass `traceStructure: true` to
- * also get the older `test_suite_run` / `test_case` spans.
+ * `opensearch.test_suite_run.result` event.
  */
 
 import { Benchmark, Op, evaluate, register, withObserve } from '../src/index.js';

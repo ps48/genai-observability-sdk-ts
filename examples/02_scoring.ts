@@ -70,10 +70,6 @@ score({
 // 5. A failed evaluation
 score({ name: 'toxicity', traceId: ids.traceId, spanId: ids.spanId, errorType: 'timeout' });
 
-// 6. Deprecated: the old span carrier (child span "evaluation <name>"), kept
-//    for one release. Also selectable with OPENSEARCH_GENAI_EVAL_CARRIER=span.
-score({ name: 'legacy', value: 0.5, traceId: ids.traceId, spanId: ids.spanId, carrier: 'span' });
-
 // Flush traces and evaluation events
 await provider.shutdown();
 console.log('Scores have been recorded as gen_ai.evaluation.result events!');

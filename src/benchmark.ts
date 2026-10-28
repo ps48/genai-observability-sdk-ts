@@ -4,7 +4,7 @@
 /**
  * Offline evaluation runs: `evaluate()` and `Benchmark`.
  *
- * Default shape (no harness spans):
+ * Shape of a run:
  *
  * ```
  * trace (one per test case)       the agent run, exactly like production
@@ -14,37 +14,28 @@
  * LogRecord opensearch.test_suite_run.result   one per run, no trace context
  * ```
  *
- * `traceStructure: true` also creates the older `test_suite_run <suite>` /
- * `test_case <case>` spans (scores then parent to the case span) and still
- * emits the case and run events.
+ * The SDK creates no spans of its own for a run.
  */
 
 import {
   trace,
   context as otelContext,
   ROOT_CONTEXT,
-  SpanStatusCode,
   TraceFlags,
-  type Span,
   type SpanContext,
-  type Context,
-  type Link,
   type Attributes,
 } from '@opentelemetry/api';
 import { SeverityNumber } from '@opentelemetry/api-logs';
 import { createHash, randomUUID } from 'crypto';
 import { RESERVED_KEYS, normalizeSpanId, normalizeTraceId, validateMetadataKeys } from './internal.js';
-import { resolveLoggerProvider } from './logs.js';
+import { getEventLogger } from './logs.js';
 import { score } from './score.js';
 import {
-  BENCHMARK_TRACER_NAME,
   ensureGlobalTestCaseProcessor,
   runInTestCase,
   type ActiveTestCase,
 } from './testcase.js';
-import { SDK_SCOPE_NAME, SDK_VERSION } from './version.js';
 
-const TRACER_NAME = BENCHMARK_TRACER_NAME;
 const IO_TRUNCATION_LIMIT = 10_000;
 const TRUNCATION_MARKER = "...[truncated]";
 
@@ -189,11 +180,6 @@ function spanContextFrom(traceIdHex?: string, spanIdHex?: string): SpanContext |
   return { traceId, spanId, traceFlags: TraceFlags.SAMPLED, isRemote: true };
 }
 
-function buildSpanLink(traceIdHex?: string, spanIdHex?: string): Link | null {
-  const spanContext = spanContextFrom(traceIdHex, spanIdHex);
-  return spanContext ? { context: spanContext } : null;
-}
-
 interface CaseIdentity {
   suiteName: string;
   runId: string;
@@ -213,8 +199,8 @@ function identityAttributes(identity: CaseIdentity): Record<string, string> {
 
 /**
  * Emit one gen_ai.evaluation.result event per score, with the suite and case
- * identity copied. `target` is the evaluated span (the agent run's root span,
- * a caller-supplied span, or the opt-in test_case span). With only a trace id
+ * identity copied. `target` is the evaluated span (the agent run's root span
+ * or a caller-supplied span). With only a trace id
  * the score is trace-level; with neither the event has no trace context.
  */
 function emitCaseScores(
@@ -243,7 +229,7 @@ function emitEvent(eventName: string, attributes: Attributes, parent?: SpanConte
   const ctx = parent
     ? trace.setSpanContext(ROOT_CONTEXT, { ...parent, isRemote: true })
     : ROOT_CONTEXT;
-  resolveLoggerProvider().getLogger(SDK_SCOPE_NAME, SDK_VERSION).emit({
+  getEventLogger().emit({
     eventName,
     timestamp: Date.now(),
     severityNumber: SeverityNumber.INFO,
@@ -355,52 +341,6 @@ function formatSummary(summary: BenchmarkSummary): string {
   return lines.join('\n');
 }
 
-/** Opt-in harness span tree (`traceStructure: true`). */
-class SuiteSpans {
-  readonly rootSpan: Span;
-  readonly rootContext: Context;
-
-  constructor(name: string, runId: string, metadata: Attributes) {
-    this.rootSpan = trace.getTracer(TRACER_NAME).startSpan(`test_suite_run ${name}`, {
-      attributes: { ...metadata, "test.suite.name": name, "test.suite.run.id": runId },
-    });
-    this.rootContext = trace.setSpan(otelContext.active(), this.rootSpan);
-  }
-
-  startCase(identity: CaseIdentity, attributes: Attributes, links: Link[] = []): Span {
-    return trace.getTracer(TRACER_NAME).startSpan(
-      `test_case ${identity.caseName ?? identity.caseId}`,
-      { attributes: { ...attributes, ...identityAttributes(identity) }, links },
-      this.rootContext,
-    );
-  }
-
-  end(errorCount: number): void {
-    this.rootSpan.setAttribute("test.suite.run.status", errorCount === 0 ? 'success' : 'failure');
-    if (errorCount > 0) {
-      this.rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: `${errorCount} case(s) failed` });
-    }
-    this.rootSpan.end();
-  }
-}
-
-function finishCaseSpan(
-  span: Span,
-  legacyStatus: string,
-  error: string | undefined,
-  io: { recordIo: boolean; input?: unknown; output?: unknown; expected?: unknown },
-): void {
-  span.setAttribute("test.case.result.status", legacyStatus);
-  if (error) span.setAttribute("opensearch.test_case.error", error);
-  if (io.recordIo) {
-    if (io.input !== undefined) span.setAttribute("opensearch.test_case.input", truncateIo(io.input));
-    if (io.output !== undefined) span.setAttribute("opensearch.test_case.output", truncateIo(io.output));
-    if (io.expected !== undefined) span.setAttribute("opensearch.test_case.expected", truncateIo(io.expected));
-  }
-  if (legacyStatus === 'fail') span.setStatus({ code: SpanStatusCode.ERROR, message: error });
-  span.end();
-}
-
 // ---------------------------------------------------------------------------
 // Benchmark class
 // ---------------------------------------------------------------------------
@@ -408,8 +348,6 @@ function finishCaseSpan(
 export interface BenchmarkOptions {
   metadata?: Record<string, unknown>;
   recordIo?: boolean;
-  /** Also create `test_suite_run` / `test_case` spans (pre-0.2 shape). Default false. */
-  traceStructure?: boolean;
 }
 
 /**
@@ -425,7 +363,6 @@ export class Benchmark {
   private _start: number;
   private _cases: TestCaseResult[] = [];
   private _closed = false;
-  private _spans?: SuiteSpans;
 
   constructor(name: string, options?: BenchmarkOptions) {
     this._name = name;
@@ -433,9 +370,6 @@ export class Benchmark {
     this._recordIo = options?.recordIo ?? false;
     this._runId = makeRunId();
     this._start = performance.now();
-    if (options?.traceStructure) {
-      this._spans = new SuiteSpans(name, this._runId, toAttributes(this._metadata));
-    }
   }
 
   get name(): string {
@@ -491,32 +425,11 @@ export class Benchmark {
     const caseMeta = toAttributes(safeMetadata(options.metadata, `case:${caseId}`));
     const evaluated = spanContextFrom(options.traceId, options.spanId);
 
-    let caseSpan: Span | undefined;
-    if (this._spans) {
-      const links: Link[] = [];
-      const link = buildSpanLink(options.traceId, options.spanId);
-      if (link) links.push(link);
-      caseSpan = this._spans.startCase(identity, caseMeta, links);
-    }
-
     if (options.scores) {
       const evalScores: EvalScore[] = Object.entries(options.scores).map(
         ([name, value]) => ({ name, value }),
       );
-      const caseIds = caseSpan?.spanContext();
-      const target = options.traceId
-        ? { traceId: options.traceId, spanId: options.spanId }
-        : { traceId: caseIds?.traceId, spanId: caseIds?.spanId };
-      emitCaseScores(evalScores, identity, target);
-    }
-
-    if (caseSpan) {
-      finishCaseSpan(caseSpan, legacyStatus, options.error, {
-        recordIo: this._recordIo,
-        input: options.input,
-        output: options.output,
-        expected: options.expected,
-      });
+      emitCaseScores(evalScores, identity, { traceId: options.traceId, spanId: options.spanId });
     }
 
     emitCaseEvent({
@@ -529,7 +442,7 @@ export class Benchmark {
       expected: options.expected,
       durationMs: options.durationMs,
       metadata: { ...toAttributes(this._metadata), ...caseMeta },
-      parent: evaluated ?? caseSpan?.spanContext(),
+      parent: evaluated,
     });
 
     this._cases.push({
@@ -556,7 +469,6 @@ export class Benchmark {
     this._closed = true;
 
     const summary = computeSummary(this._name, this._runId, this._cases, elapsedMs(this._start));
-    this._spans?.end(summary.errorCount);
     emitRunEvent(summary, toAttributes(this._metadata));
     console.log(formatSummary(summary));
     return summary;
@@ -576,12 +488,6 @@ export interface EvaluateOptions {
   scores: ScorerFn[];
   metadata?: Record<string, unknown>;
   recordIo?: boolean;
-  /**
-   * Also create `test_suite_run` / `test_case` spans (pre-0.2 shape). The task
-   * runs inside the case span and scores parent to it. Case and run events
-   * are still emitted. Default false.
-   */
-  traceStructure?: boolean;
 }
 
 /**
@@ -602,9 +508,6 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
   const cases: TestCaseResult[] = [];
 
   ensureGlobalTestCaseProcessor();
-  const spans = options.traceStructure
-    ? new SuiteSpans(options.name, runId, filteredMetadata)
-    : undefined;
 
   for (const item of options.data) {
     const caseStart = performance.now();
@@ -623,14 +526,11 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
     const evalScores: EvalScore[] = [];
     const scorerErrors: string[] = [];
 
-    const caseSpan = spans?.startCase(identity, {});
-    // Default: the agent run is its own trace. traceStructure: inside the case span.
-    const taskContext = caseSpan ? trace.setSpan(otelContext.active(), caseSpan) : ROOT_CONTEXT;
     const active: ActiveTestCase = { attributes: identityAttributes(identity), seen: new Set() };
 
     // Run task
     try {
-      output = runInTestCase(active, () => otelContext.with(taskContext, () => options.task(item.input)));
+      output = runInTestCase(active, () => otelContext.with(ROOT_CONTEXT, () => options.task(item.input)));
       if (output instanceof Promise) {
         output.catch(() => {});
         throw new Error(
@@ -673,19 +573,7 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
     const resultStatus: TestCaseStatus = errorType ? 'error' : 'pass';
     const legacyStatus = resultStatus === 'error' ? 'fail' : 'pass';
     const root = active.root;
-    const caseIds = caseSpan?.spanContext();
-
-    const scoreTarget = caseIds ?? root;
-    emitCaseScores(evalScores, identity, { traceId: scoreTarget?.traceId, spanId: scoreTarget?.spanId });
-
-    if (caseSpan) {
-      finishCaseSpan(caseSpan, legacyStatus, error ?? scorerErrors[0], {
-        recordIo,
-        input: item.input,
-        output,
-        expected,
-      });
-    }
+    emitCaseScores(evalScores, identity, { traceId: root?.traceId, spanId: root?.spanId });
 
     const durationMs = elapsedMs(caseStart);
     emitCaseEvent({
@@ -698,7 +586,7 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
       expected,
       durationMs,
       metadata: filteredMetadata,
-      parent: root ?? caseIds,
+      parent: root,
     });
 
     cases.push({
@@ -720,7 +608,6 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
   }
 
   const summary = computeSummary(options.name, runId, cases, elapsedMs(runStart));
-  spans?.end(summary.errorCount);
   emitRunEvent(summary, filteredMetadata);
   console.log(formatSummary(summary));
 

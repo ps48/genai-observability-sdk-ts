@@ -4,8 +4,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { trace, ROOT_CONTEXT, TraceFlags } from '@opentelemetry/api';
 import { SeverityNumber } from '@opentelemetry/api-logs';
-import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
-import { AWSSigV4OTLPExporter, AWSSigV4OTLPLogExporter } from '../src/exporters.js';
+import {
+  InMemoryLogRecordExporter,
+  LoggerProvider,
+  SimpleLogRecordProcessor,
+  type LogRecordExporter,
+} from '@opentelemetry/sdk-logs';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http';
+import {
+  AWSSigV4OTLPExporter,
+  AWSSigV4OTLPLogExporter,
+  forceDoubleAttributes,
+  sendScoresAsDouble,
+} from '../src/exporters.js';
 
 describe('AWSSigV4OTLPExporter', () => {
   const originalEnv = process.env;
@@ -139,5 +150,71 @@ describe('AWSSigV4OTLPLogExporter', () => {
     expect(record.traceId).toBe('abcdef1234567890abcdef1234567890');
     expect(record.spanId).toBe('1234567890abcdef');
     await provider.shutdown();
+  });
+});
+
+describe('double-typed attributes over OTLP/JSON', () => {
+  function emitTo(exporter: LogRecordExporter, value: number) {
+    const provider = new LoggerProvider({ processors: [new SimpleLogRecordProcessor({ exporter })] });
+    provider.getLogger('judge').emit({
+      eventName: 'gen_ai.evaluation.result',
+      attributes: { 'gen_ai.evaluation.name': 'acc', 'gen_ai.evaluation.score.value': value, 'other.count': 3 },
+    });
+    return provider;
+  }
+
+  function attrsOf(body: Uint8Array | Buffer) {
+    const parsed = JSON.parse(Buffer.from(body).toString('utf8'));
+    const list = parsed.resourceLogs[0].scopeLogs[0].logRecords[0].attributes as {
+      key: string;
+      value: Record<string, unknown>;
+    }[];
+    return Object.fromEntries(list.map(kv => [kv.key, kv.value]));
+  }
+
+  it('forceDoubleAttributes re-encodes whole-number scores only', () => {
+    const body = Buffer.from(JSON.stringify({
+      resourceLogs: [{ scopeLogs: [{ logRecords: [{ attributes: [
+        { key: 'gen_ai.evaluation.score.value', value: { intValue: 1 } },
+        { key: 'other.count', value: { intValue: 3 } },
+      ] }] }] }],
+    }));
+    const attrs = attrsOf(forceDoubleAttributes(new Uint8Array(body)));
+    expect(attrs['gen_ai.evaluation.score.value']).toEqual({ doubleValue: 1 });
+    expect(attrs['other.count']).toEqual({ intValue: 3 });
+  });
+
+  it('OTLPLogExporter sends a score of 1 as doubleValue', async () => {
+    const exporter = new OTLPLogExporter({ url: 'http://localhost:1/v1/logs' });
+    expect(sendScoresAsDouble(exporter)).toBe(true);
+    const serializer = (exporter as unknown as {
+      _delegate: { _serializer: { serializeRequest(l: unknown[]): Uint8Array } };
+    })._delegate._serializer;
+    const memory = new InMemoryLogRecordExporter();
+    const provider = emitTo(memory, 1);
+    const attrs = attrsOf(serializer.serializeRequest(memory.getFinishedLogRecords()));
+    expect(attrs['gen_ai.evaluation.score.value']).toEqual({ doubleValue: 1 });
+    expect(attrs['other.count']).toEqual({ intValue: 3 });
+    await provider.shutdown();
+    await exporter.shutdown();
+  });
+
+  it('AWSSigV4OTLPLogExporter sends a score of 1 as doubleValue', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.doMock('@aws-sdk/credential-providers', () => ({
+      fromNodeProviderChain: () => async () => ({ accessKeyId: 'AKIDEXAMPLE', secretAccessKey: 'secret' }),
+    }));
+    const exporter = new AWSSigV4OTLPLogExporter({
+      endpoint: 'https://pipe.us-east-1.osis.amazonaws.com/v1/logs',
+      region: 'us-east-1',
+    });
+    const provider = emitTo(exporter, 1);
+    await exporter.forceFlush();
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(attrsOf(init.body as Buffer)['gen_ai.evaluation.score.value']).toEqual({ doubleValue: 1 });
+    await provider.shutdown();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 });

@@ -4,9 +4,6 @@
 import { trace, type Context, type SpanContext } from '@opentelemetry/api';
 import type { ReadableSpan, Span, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 
-/** Tracer name of the harness spans (`test_suite_run` / `test_case`, opt-in). */
-export const BENCHMARK_TRACER_NAME = "opensearch-genai-observability-sdk-ts-benchmarks";
-
 /**
  * The test case evaluate() is running right now.
  *
@@ -36,14 +33,6 @@ export function runInTestCase<T>(testCase: ActiveTestCase, fn: () => T): T {
   }
 }
 
-function scopeName(span: Span): string | undefined {
-  const s = span as unknown as {
-    instrumentationLibrary?: { name?: string };
-    instrumentationScope?: { name?: string };
-  };
-  return s.instrumentationScope?.name ?? s.instrumentationLibrary?.name;
-}
-
 function parentSpanId(span: Span): string | undefined {
   const s = span as unknown as { parentSpanId?: string; parentSpanContext?: SpanContext };
   return s.parentSpanContext?.spanId ?? s.parentSpanId;
@@ -56,8 +45,7 @@ function parentSpanId(span: Span): string | undefined {
  * `opensearch.test_case.result` event and score events are parented to it.
  *
  * A span is a case root when it has no parent, or when its parent was not
- * started inside the same case (for example a remote parent, or the opt-in
- * `test_case` harness span). Without a context manager every span is a root,
+ * started inside the same case (for example a remote parent). Without a context manager every span is a root,
  * so all of them are stamped and the first one is used as the trace context.
  *
  * register() installs it. evaluate() also adds it to the global
@@ -69,7 +57,6 @@ export class TestCaseSpanProcessor implements SpanProcessor {
   onStart(span: Span, _parentContext: Context): void {
     const testCase = activeCase;
     if (!testCase) return;
-    if (scopeName(span) === BENCHMARK_TRACER_NAME) return;
 
     const ctx = span.spanContext();
     const parent = parentSpanId(span);

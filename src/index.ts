@@ -7,10 +7,9 @@ export { observe, withObserve, Op } from './observe.js';
 export type { ObserveOptions } from './observe.js';
 export { enrich, markAgentRoot, AGENT_ROOT_ATTRIBUTE } from './enrich.js';
 export type { EnrichOptions } from './enrich.js';
-export { score, EVALUATION_RESULT_EVENT, EVAL_CARRIER_ENV } from './score.js';
+export { score, EVALUATION_RESULT_EVENT } from './score.js';
 export type {
   ScoreOptions,
-  EvaluationCarrier,
   EvaluationLevel,
   EvaluatorType,
   ScoreDirection,

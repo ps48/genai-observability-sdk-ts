@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { trace } from '@opentelemetry/api';
 import { SeverityNumber } from '@opentelemetry/api-logs';
-import { score, _resetScoreWarnings, EVALUATION_RESULT_EVENT } from '../src/score.js';
+import { score, EVALUATION_RESULT_EVENT } from '../src/score.js';
 import { SDK_SCOPE_NAME, SDK_VERSION } from '../src/version.js';
 import { getFinishedSpans, getFinishedLogRecords, clearSpans } from './setup.js';
 
@@ -15,13 +15,10 @@ let warnSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   clearSpans();
-  _resetScoreWarnings();
-  delete process.env.OPENSEARCH_GENAI_EVAL_CARRIER;
   warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => {
   clearSpans();
-  delete process.env.OPENSEARCH_GENAI_EVAL_CARRIER;
   warnSpy.mockRestore();
 });
 
@@ -31,7 +28,7 @@ function onlyRecord() {
   return records[0];
 }
 
-describe('score (event carrier, default)', () => {
+describe('score', () => {
   it('emits one gen_ai.evaluation.result log event and no span', () => {
     const before = Date.now();
     score({ name: 'accuracy', value: 0.95 });
@@ -219,70 +216,30 @@ describe('score (event carrier, default)', () => {
     ]);
   });
 
-  it('does not warn for the default carrier', () => {
-    score({ name: 'x', value: 1 });
+  it('does not warn and never creates a span', () => {
+    score({ name: 'x', value: 1, traceId: TRACE_ID, spanId: SPAN_ID });
     expect(warnSpy).not.toHaveBeenCalled();
-  });
-});
-
-describe('score (deprecated span carrier)', () => {
-  it('carrier "span" creates an evaluation span with a span event and no log event', () => {
-    score({ name: 'accuracy', value: 0.95, label: 'good', carrier: 'span' });
-
-    expect(getFinishedLogRecords()).toHaveLength(0);
-    const spans = getFinishedSpans();
-    expect(spans).toHaveLength(1);
-    const span = spans[0];
-    expect(span.name).toBe('evaluation accuracy');
-    expect(span.attributes['gen_ai.operation.name']).toBe('evaluation');
-    expect(span.attributes['gen_ai.evaluation.name']).toBe('accuracy');
-    expect(span.attributes['gen_ai.evaluation.score.value']).toBe(0.95);
-    expect(span.attributes['gen_ai.evaluation.score.label']).toBe('good');
-    const ev = span.events.find(e => e.name === 'gen_ai.evaluation.result');
-    expect(ev?.attributes?.['gen_ai.evaluation.score.value']).toBe(0.95);
-  });
-
-  it('span carrier is a child of the stored span', () => {
-    score({ name: 'x', value: 1, traceId: TRACE_ID, spanId: SPAN_ID, carrier: 'span' });
-    const [span] = getFinishedSpans();
-    expect(span.spanContext().traceId).toBe(TRACE_ID);
-    expect(span.parentSpanId).toBe(SPAN_ID);
-  });
-
-  it('span carrier never derives a root span id from the trace id', () => {
-    score({ name: 'x', value: 1, traceId: TRACE_ID, carrier: 'span' });
-    const [span] = getFinishedSpans();
-    expect(span.parentSpanId).toBeUndefined();
-    expect(span.parentSpanId).not.toBe(TRACE_ID.slice(16));
-    expect(span.attributes['opensearch.evaluation.trace_id']).toBe(TRACE_ID);
-    expect(span.attributes['opensearch.evaluation.level']).toBe('trace');
-  });
-
-  it('env OPENSEARCH_GENAI_EVAL_CARRIER=span selects the span carrier', () => {
-    process.env.OPENSEARCH_GENAI_EVAL_CARRIER = 'span';
-    score({ name: 'x', value: 1 });
-    expect(getFinishedSpans()).toHaveLength(1);
-    expect(getFinishedLogRecords()).toHaveLength(0);
-  });
-
-  it('explicit carrier overrides the env var', () => {
-    process.env.OPENSEARCH_GENAI_EVAL_CARRIER = 'span';
-    score({ name: 'x', value: 1, carrier: 'event' });
     expect(getFinishedSpans()).toHaveLength(0);
-    expect(getFinishedLogRecords()).toHaveLength(1);
   });
 
-  it('carrier "both" emits the event and the span', () => {
-    score({ name: 'x', value: 1, traceId: TRACE_ID, spanId: SPAN_ID, carrier: 'both' });
-    expect(getFinishedSpans()).toHaveLength(1);
+  it('sets SDK scope attributes on every logger, evaluator-named or not', () => {
+    score({ name: 'a', value: 1 });
+    score({ name: 'b', value: 1, evaluator: 'judge', evaluatorVersion: '2' });
+    const [plain, judged] = getFinishedLogRecords();
+    for (const r of [plain, judged]) {
+      expect(r.instrumentationScope.attributes).toEqual({
+        'opensearch.genai.sdk.name': 'opensearch-genai-observability-sdk-ts',
+        'opensearch.genai.sdk.version': SDK_VERSION,
+      });
+    }
+    expect(judged.instrumentationScope.name).toBe('judge');
+    expect(judged.instrumentationScope.version).toBe('2');
+  });
+
+  it('uses the SDK version, not evaluatorVersion, when no evaluator is named', () => {
+    score({ name: 'a', value: 1, evaluatorVersion: '9' });
     const r = onlyRecord();
-    expect(r.spanContext?.spanId).toBe(SPAN_ID);
-  });
-
-  it('warns once about the deprecated carrier', () => {
-    score({ name: 'a', value: 1, carrier: 'span' });
-    score({ name: 'b', value: 1, carrier: 'both' });
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(String(warnSpy.mock.calls[0][0])).toMatch(/deprecated/);
+    expect(r.instrumentationScope.name).toBe(SDK_SCOPE_NAME);
+    expect(r.instrumentationScope.version).toBe(SDK_VERSION);
   });
 });

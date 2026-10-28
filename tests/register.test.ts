@@ -226,7 +226,6 @@ describe('register - logs pipeline for evaluation events', () => {
     delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
     delete process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL;
     delete process.env.OTEL_EXPORTER_OTLP_PROTOCOL;
-    delete process.env.OPENSEARCH_GENAI_EVAL_CARRIER;
   });
 
   afterEach(() => {
@@ -350,19 +349,18 @@ describe('register - logs pipeline for evaluation events', () => {
   });
 
   it('creates an OTLP/HTTP log exporter by default', async () => {
-    const exporter = await createLogExporter({}, DEFAULT_ENDPOINT, 'http');
+    const { exporter } = await createLogExporter({}, 'http');
     expect(exporter).toBeInstanceOf(OTLPLogExporter);
   });
 
   it('derives a SigV4 log exporter from a SigV4 trace exporter', async () => {
-    const exporter = await createLogExporter(
+    const { exporter } = await createLogExporter(
       {
         exporter: new AWSSigV4OTLPExporter({
           endpoint: 'https://pipe.us-east-1.osis.amazonaws.com/v1/traces',
           region: 'us-east-1',
         }),
       },
-      DEFAULT_ENDPOINT,
       'http',
     );
     expect(exporter).toBeInstanceOf(AWSSigV4OTLPLogExporter);
@@ -372,7 +370,7 @@ describe('register - logs pipeline for evaluation events', () => {
   });
 
   it('SigV4 log exporter honors an explicit logsEndpoint', async () => {
-    const exporter = await createLogExporter(
+    const { exporter } = await createLogExporter(
       {
         logsEndpoint: 'https://logs-pipe.us-east-1.osis.amazonaws.com/v1/logs',
         exporter: new AWSSigV4OTLPExporter({
@@ -380,7 +378,6 @@ describe('register - logs pipeline for evaluation events', () => {
           region: 'us-east-1',
         }),
       },
-      DEFAULT_ENDPOINT,
       'http',
     );
     expect((exporter as AWSSigV4OTLPLogExporter).endpoint).toBe(
@@ -393,12 +390,66 @@ describe('register - logs pipeline for evaluation events', () => {
     const provider = await register({
       endpoint: 'http://collector:4317',
       protocol: 'grpc',
-      exporter: new InMemorySpanExporter(),
       setGlobal: false,
       autoInstrument: false,
     });
     expect(getSdkLoggerProvider()).toBeUndefined();
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/logsEndpoint/));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/NOT exported: traces are exported over gRPC/));
+    warnSpy.mockRestore();
+    await provider.shutdown();
+  });
+
+  it('SigV4: warns and skips when the traces URL does not end in /v1/traces', async () => {
+    const { exporter, reason } = await createLogExporter(
+      {
+        exporter: new AWSSigV4OTLPExporter({
+          endpoint: 'https://pipe.us-east-1.osis.amazonaws.com/ingest',
+          region: 'us-east-1',
+        }),
+      },
+      'http',
+    );
+    expect(exporter).toBeNull();
+    expect(reason).toMatch(/does not end in \/v1\/traces/);
+    expect(reason).toMatch(/OSIS logs pipeline/);
+  });
+
+  it('SigV4: uses OTEL_EXPORTER_OTLP_LOGS_ENDPOINT', async () => {
+    process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = 'https://logs.us-east-1.osis.amazonaws.com/v1/logs';
+    const { exporter } = await createLogExporter(
+      {
+        exporter: new AWSSigV4OTLPExporter({
+          endpoint: 'https://pipe.us-east-1.osis.amazonaws.com/ingest',
+          region: 'us-east-1',
+        }),
+      },
+      'http',
+    );
+    expect((exporter as AWSSigV4OTLPLogExporter).endpoint).toBe(
+      'https://logs.us-east-1.osis.amazonaws.com/v1/logs',
+    );
+  });
+
+  it('a custom span exporter needs logsEndpoint or logExporter', async () => {
+    const skipped = await createLogExporter({ exporter: new InMemorySpanExporter() }, 'http');
+    expect(skipped.exporter).toBeNull();
+    expect(skipped.reason).toMatch(/custom exporter/);
+    const { exporter } = await createLogExporter(
+      { exporter: new InMemorySpanExporter(), logsEndpoint: 'http://c:4318/v1/logs' },
+      'http',
+    );
+    expect(exporter).toBeInstanceOf(OTLPLogExporter);
+  });
+
+  it('warns and skips for an explicit traces endpoint without /v1/traces', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const provider = await register({
+      endpoint: 'http://collector:4318/custom/ingest',
+      setGlobal: false,
+      autoInstrument: false,
+    });
+    expect(getSdkLoggerProvider()).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/does not end in \/v1\/traces/));
     warnSpy.mockRestore();
     await provider.shutdown();
   });
@@ -418,32 +469,51 @@ describe('resolveLogsEndpoint', () => {
     process.env = originalEnv;
   });
 
-  it('derives the default logs endpoint from the default traces endpoint', () => {
-    expect(resolveLogsEndpoint({}, DEFAULT_ENDPOINT, 'http')).toBe(DEFAULT_LOGS_ENDPOINT);
+  it('uses the default logs endpoint when nothing is configured', () => {
+    expect(resolveLogsEndpoint({}, 'http').url).toBe(DEFAULT_LOGS_ENDPOINT);
     expect(DEFAULT_LOGS_ENDPOINT).toBe('http://localhost:21890/opentelemetry/v1/logs');
   });
 
   it('swaps /v1/traces for /v1/logs on an explicit endpoint', () => {
-    expect(
-      resolveLogsEndpoint({ endpoint: 'http://c:4318/v1/traces' }, 'http://c:4318/v1/traces', 'http'),
-    ).toBe('http://c:4318/v1/logs');
+    expect(resolveLogsEndpoint({ endpoint: 'http://c:4318/v1/traces' }, 'http').url).toBe(
+      'http://c:4318/v1/logs',
+    );
+    expect(resolveLogsEndpoint({ endpoint: 'http://c:4318/v1/traces/' }, 'http').url).toBe(
+      'http://c:4318/v1/logs',
+    );
   });
 
   it('prefers logsEndpoint, then OTEL_EXPORTER_OTLP_LOGS_ENDPOINT', () => {
     process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = 'http://env-logs:4318/v1/logs';
-    expect(resolveLogsEndpoint({ logsEndpoint: 'http://opt/v1/logs' }, DEFAULT_ENDPOINT, 'http')).toBe(
-      'http://opt/v1/logs',
+    expect(
+      resolveLogsEndpoint({ logsEndpoint: 'http://opt/v1/logs', endpoint: 'http://c/v1/traces' }, 'http').url,
+    ).toBe('http://opt/v1/logs');
+    expect(resolveLogsEndpoint({ endpoint: 'http://c/custom' }, 'http').url).toBe(
+      'http://env-logs:4318/v1/logs',
     );
-    expect(resolveLogsEndpoint({}, DEFAULT_ENDPOINT, 'http')).toBe('http://env-logs:4318/v1/logs');
+    expect(resolveLogsEndpoint({}, 'grpc').url).toBe('http://env-logs:4318/v1/logs');
   });
 
   it('uses OTEL_EXPORTER_OTLP_ENDPOINT base + /v1/logs', () => {
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'http://base:4318/';
-    expect(resolveLogsEndpoint({}, 'http://base:4318/v1/traces', 'http')).toBe('http://base:4318/v1/logs');
+    expect(resolveLogsEndpoint({}, 'http').url).toBe('http://base:4318/v1/logs');
+    process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://other:4318/custom';
+    expect(resolveLogsEndpoint({}, 'http').url).toBe('http://base:4318/v1/logs');
   });
 
-  it('returns null for gRPC or non-standard traces paths', () => {
-    expect(resolveLogsEndpoint({}, 'http://c:4317', 'grpc')).toBeNull();
-    expect(resolveLogsEndpoint({}, 'http://c/custom/ingest', 'http')).toBeNull();
+  it('derives from OTEL_EXPORTER_OTLP_TRACES_ENDPOINT only when it ends in /v1/traces', () => {
+    process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://t:4318/v1/traces';
+    expect(resolveLogsEndpoint({}, 'http').url).toBe('http://t:4318/v1/logs');
+    process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://t:4318/ingest';
+    const r = resolveLogsEndpoint({}, 'http');
+    expect(r.url).toBeNull();
+    expect(r.reason).toMatch(/OTEL_EXPORTER_OTLP_TRACES_ENDPOINT .* does not end in \/v1\/traces/);
+  });
+
+  it('returns null with a reason for gRPC or non-standard traces paths', () => {
+    expect(resolveLogsEndpoint({ endpoint: 'http://c:4317' }, 'grpc').reason).toMatch(/gRPC/);
+    const r = resolveLogsEndpoint({ endpoint: 'http://c/custom/ingest' }, 'http');
+    expect(r.url).toBeNull();
+    expect(r.reason).toMatch(/does not end in \/v1\/traces/);
   });
 });

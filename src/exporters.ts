@@ -177,6 +177,74 @@ function loadLogsSerializer(): LogsSerializer {
   return logsSerializer;
 }
 
+/** Attributes that OTel semconv types as double. */
+const DOUBLE_ATTRIBUTES: ReadonlySet<string> = new Set([
+  "gen_ai.evaluation.score.value",
+  "opensearch.evaluation.score.min",
+  "opensearch.evaluation.score.max",
+  "opensearch.test_case.duration_ms",
+  "opensearch.test_suite_run.duration_ms",
+]);
+
+interface OtlpKeyValue {
+  key?: string;
+  value?: { intValue?: number | string; doubleValue?: number };
+}
+
+/**
+ * Re-encode whole-number values of double-typed attributes in an OTLP/JSON
+ * logs request as `doubleValue`. OTel JS encodes any integral JS number as
+ * `intValue`, and the logs API has no way to ask for a double, so a score of
+ * `1` would otherwise arrive as an int64.
+ */
+export function forceDoubleAttributes(serialized: Uint8Array): Uint8Array {
+  const text = Buffer.from(serialized).toString("utf8");
+  if (!text.includes('"intValue"')) return serialized;
+  const request = JSON.parse(text) as {
+    resourceLogs?: { scopeLogs?: { logRecords?: { attributes?: OtlpKeyValue[] }[] }[] }[];
+  };
+  let changed = false;
+  for (const rl of request.resourceLogs ?? []) {
+    for (const sl of rl.scopeLogs ?? []) {
+      for (const record of sl.logRecords ?? []) {
+        for (const kv of record.attributes ?? []) {
+          const value = kv.value;
+          if (!kv.key || !DOUBLE_ATTRIBUTES.has(kv.key) || value?.intValue === undefined) continue;
+          value.doubleValue = Number(value.intValue);
+          delete value.intValue;
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed ? new Uint8Array(Buffer.from(JSON.stringify(request), "utf8")) : serialized;
+}
+
+function doubleAttributesSerializer(base: LogsSerializer): LogsSerializer {
+  return {
+    serializeRequest(logs: ReadableLogRecord[]): Uint8Array | undefined {
+      const serialized = base.serializeRequest(logs);
+      return serialized ? forceDoubleAttributes(serialized) : serialized;
+    },
+  };
+}
+
+/**
+ * Make an `@opentelemetry/exporter-logs-otlp-http` OTLPLogExporter send
+ * double-typed attributes (for example `gen_ai.evaluation.score.value`) as
+ * `doubleValue` even when the value is a whole number. Wraps the exporter's
+ * OTLP/JSON serializer; returns false (and changes nothing) when the exporter
+ * does not have the expected internals.
+ */
+export function sendScoresAsDouble(exporter: unknown): boolean {
+  const delegate = (exporter as { _delegate?: { _serializer?: LogsSerializer & { deserializeResponse?: unknown } } })
+    ?._delegate;
+  const serializer = delegate?._serializer;
+  if (!delegate || typeof serializer?.serializeRequest !== "function") return false;
+  delegate._serializer = { ...serializer, ...doubleAttributesSerializer(serializer) };
+  return true;
+}
+
 /**
  * An OTLP log exporter that signs HTTP requests with AWS SigV4 (OTLP/JSON).
  * Used for `gen_ai.evaluation.result` events sent to an AWS endpoint
@@ -214,7 +282,7 @@ export class AWSSigV4OTLPLogExporter implements LogRecordExporter {
   }
 
   private async _export(logs: ReadableLogRecord[]): Promise<void> {
-    const serialized = loadLogsSerializer().serializeRequest(logs);
+    const serialized = doubleAttributesSerializer(loadLogsSerializer()).serializeRequest(logs);
     if (!serialized) {
       throw new Error('Failed to serialize log records');
     }

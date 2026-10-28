@@ -16,7 +16,7 @@ import {
   type LogRecordExporter,
   type LoggerProviderConfig,
 } from "@opentelemetry/sdk-logs";
-import { AWSSigV4OTLPExporter, AWSSigV4OTLPLogExporter } from "./exporters.js";
+import { AWSSigV4OTLPExporter, AWSSigV4OTLPLogExporter, sendScoresAsDouble } from "./exporters.js";
 import { installTestCaseProcessor } from "./testcase.js";
 import { hasGlobalLoggerProvider, getSdkLoggerProvider, setSdkLoggerProvider } from "./logs.js";
 
@@ -45,8 +45,10 @@ export interface RegisterOptions {
    */
   logs?: boolean;
   /**
-   * OTLP/HTTP logs endpoint. Default: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, else
-   * the traces endpoint with `/v1/traces` replaced by `/v1/logs`.
+   * OTLP/HTTP logs endpoint (full URL) for evaluation events. Default:
+   * OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, else derived from the traces endpoint
+   * only when it ends in `/v1/traces`, else OTEL_EXPORTER_OTLP_ENDPOINT +
+   * `/v1/logs`. When nothing applies, register() warns and skips logs.
    */
   logsEndpoint?: string;
   /**
@@ -125,28 +127,75 @@ function tracesToLogsUrl(url: string): string | null {
   return LOGS_SUFFIX_RE.test(url) ? url.replace(LOGS_SUFFIX_RE, "/v1/logs") : null;
 }
 
+/** Result of logs endpoint resolution: a URL, or why none could be chosen. */
+export type LogsEndpointResolution =
+  | { url: string; reason?: undefined }
+  | { url: null; reason: string };
+
+function derived(tracesUrl: string, source: string): LogsEndpointResolution {
+  const url = tracesToLogsUrl(tracesUrl);
+  if (url) return { url };
+  return {
+    url: null,
+    reason:
+      `${source} "${tracesUrl}" does not end in /v1/traces, so no logs endpoint can be ` +
+      `derived from it`,
+  };
+}
+
+/**
+ * Resolve the OTLP/HTTP logs endpoint for evaluation events.
+ *
+ * 1. `logsEndpoint` option (full URL, used as-is)
+ * 2. `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (full URL, used as-is)
+ * 3. `endpoint` option, only if it ends in `/v1/traces` (swapped for `/v1/logs`)
+ * 4. `OTEL_EXPORTER_OTLP_ENDPOINT` (base URL, `/v1/logs` appended)
+ * 5. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, only if it ends in `/v1/traces`
+ * 6. No traces endpoint configured: DEFAULT_LOGS_ENDPOINT
+ *
+ * With a gRPC traces exporter only 1 and 2 apply (the logs exporter is OTLP/HTTP).
+ * Otherwise `url` is null and `reason` says why.
+ */
 export function resolveLogsEndpoint(
   options: RegisterOptions,
-  tracesEndpoint: string,
   protocol: "http" | "grpc",
-): string | null {
-  if (options.logsEndpoint) return options.logsEndpoint;
+): LogsEndpointResolution {
+  if (options.logsEndpoint) return { url: options.logsEndpoint };
 
   const logsEnv = process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
-  if (logsEnv) return logsEnv;
+  if (logsEnv) return { url: logsEnv };
 
-  // gRPC traces endpoints cannot be reused for the OTLP/HTTP logs exporter.
-  if (protocol === "grpc") return null;
-
-  if (
-    !options.endpoint &&
-    !process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT &&
-    process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-  ) {
-    return `${process.env.OTEL_EXPORTER_OTLP_ENDPOINT.replace(/\/+$/, "")}/v1/logs`;
+  if (protocol === "grpc") {
+    return {
+      url: null,
+      reason: "traces are exported over gRPC and the evaluation logs exporter is OTLP/HTTP",
+    };
   }
 
-  return tracesToLogsUrl(tracesEndpoint);
+  if (options.endpoint) return derived(options.endpoint, "traces endpoint");
+
+  const baseEnv = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  if (baseEnv) return { url: `${baseEnv.replace(/\/+$/, "")}/v1/logs` };
+
+  const tracesEnv = process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+  if (tracesEnv) return derived(tracesEnv, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+
+  return { url: DEFAULT_LOGS_ENDPOINT };
+}
+
+/**
+ * Logs endpoint for a SigV4 (OSIS) trace exporter: `logsEndpoint`, else
+ * `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, else the exporter's URL only if it ends
+ * in `/v1/traces`. An OSIS logs pipeline usually has its own URL: pass it.
+ */
+export function resolveSigV4LogsEndpoint(
+  options: RegisterOptions,
+  exporter: AWSSigV4OTLPExporter,
+): LogsEndpointResolution {
+  if (options.logsEndpoint) return { url: options.logsEndpoint };
+  const logsEnv = process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+  if (logsEnv) return { url: logsEnv };
+  return derived(exporter.endpoint, "AWSSigV4OTLPExporter endpoint");
 }
 
 type LogsResource = NonNullable<LoggerProviderConfig["resource"]>;
@@ -166,34 +215,63 @@ function logsResource(attributes: Record<string, string>): LogsResource {
   return resource;
 }
 
+/** A log exporter for evaluation events, or why none was created. */
+export type LogExporterResolution =
+  | { exporter: LogRecordExporter; reason?: undefined }
+  | { exporter: null; reason: string };
+
 export async function createLogExporter(
   options: RegisterOptions,
-  tracesEndpoint: string,
   protocol: "http" | "grpc",
-): Promise<LogRecordExporter | null> {
-  if (options.logExporter) return options.logExporter;
+): Promise<LogExporterResolution> {
+  if (options.logExporter) return { exporter: options.logExporter };
   if (options.exporter instanceof AWSSigV4OTLPExporter) {
     // Same auth as traces: sign log exports with the same service and region.
-    const endpoint =
-      options.logsEndpoint ??
-      process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT ??
-      tracesToLogsUrl(options.exporter.endpoint);
-    if (!endpoint) return null;
-    return new AWSSigV4OTLPLogExporter({
-      endpoint,
-      service: options.exporter.service,
-      region: options.exporter.region,
-    });
+    const resolved = resolveSigV4LogsEndpoint(options, options.exporter);
+    if (resolved.url === null) {
+      return {
+        exporter: null,
+        reason:
+          `${resolved.reason}. An OSIS logs pipeline has its own URL: pass ` +
+          `logsEndpoint (for example https://<logs-pipeline>.<region>.osis.amazonaws.com/v1/logs)`,
+      };
+    }
+    return {
+      exporter: new AWSSigV4OTLPLogExporter({
+        endpoint: resolved.url,
+        service: options.exporter.service,
+        region: options.exporter.region,
+      }),
+    };
   }
-  const logsEndpoint = resolveLogsEndpoint(options, tracesEndpoint, protocol);
-  if (!logsEndpoint) return null;
+  if (options.exporter) {
+    // A custom span exporter says nothing about where logs should go.
+    const url = options.logsEndpoint || process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+    if (!url) {
+      return {
+        exporter: null,
+        reason: "a custom exporter was passed without logsEndpoint or logExporter",
+      };
+    }
+    return { exporter: await otlpHttpLogExporter(url, options.headers) };
+  }
+  const resolved = resolveLogsEndpoint(options, protocol);
+  if (resolved.url === null) return { exporter: null, reason: resolved.reason };
+  return { exporter: await otlpHttpLogExporter(resolved.url, options.headers) };
+}
+
+async function otlpHttpLogExporter(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<LogRecordExporter> {
   const { OTLPLogExporter } = await import("@opentelemetry/exporter-logs-otlp-http");
-  return new OTLPLogExporter({ url: logsEndpoint, headers: options.headers });
+  const exporter = new OTLPLogExporter({ url, headers });
+  sendScoresAsDouble(exporter);
+  return exporter;
 }
 
 async function setupLogs(
   options: RegisterOptions,
-  tracesEndpoint: string,
   protocol: "http" | "grpc",
   resourceAttrs: Record<string, string>,
   setGlobal: boolean,
@@ -206,12 +284,12 @@ async function setupLogs(
     return null;
   }
 
-  const exporter = await createLogExporter(options, tracesEndpoint, protocol);
+  const { exporter, reason } = await createLogExporter(options, protocol);
   if (!exporter) {
     console.warn(
-      "[opensearch-genai-observability-sdk-ts] register(): could not derive an OTLP/HTTP logs " +
-        "endpoint, so score() evaluation events will not be exported. Pass logsEndpoint " +
-        "or set OTEL_EXPORTER_OTLP_LOGS_ENDPOINT.",
+      `[opensearch-genai-observability-sdk-ts] register(): evaluation logs are NOT exported: ` +
+        `${reason}. score() and evaluate() events are dropped. Pass logsEndpoint ` +
+        `(or logExporter), or set OTEL_EXPORTER_OTLP_LOGS_ENDPOINT.`,
     );
     return null;
   }
@@ -309,7 +387,6 @@ export async function register(
 
   const loggerProvider = await setupLogs(
     options,
-    endpoint,
     protocol,
     resourceAttrs,
     setGlobal,
