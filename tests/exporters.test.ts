@@ -176,11 +176,13 @@ describe('double-typed attributes over OTLP/JSON', () => {
     const body = Buffer.from(JSON.stringify({
       resourceLogs: [{ scopeLogs: [{ logRecords: [{ attributes: [
         { key: 'gen_ai.evaluation.score.value', value: { intValue: 1 } },
+        { key: 'opensearch.evaluation.score.threshold', value: { intValue: 4 } },
         { key: 'other.count', value: { intValue: 3 } },
       ] }] }] }],
     }));
     const attrs = attrsOf(forceDoubleAttributes(new Uint8Array(body)));
     expect(attrs['gen_ai.evaluation.score.value']).toEqual({ doubleValue: 1 });
+    expect(attrs['opensearch.evaluation.score.threshold']).toEqual({ doubleValue: 4 });
     expect(attrs['other.count']).toEqual({ intValue: 3 });
   });
 

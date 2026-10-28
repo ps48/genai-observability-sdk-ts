@@ -29,7 +29,14 @@ import { SeverityNumber } from '@opentelemetry/api-logs';
 import { createHash, randomUUID } from 'crypto';
 import { RESERVED_KEYS, normalizeSpanId, normalizeTraceId, validateMetadataKeys } from './internal.js';
 import { getEventLogger } from './logs.js';
-import { score } from './score.js';
+import {
+  score,
+  normalizeAssessment,
+  resolveAssessment,
+  type Assessment,
+  type EvaluatorType,
+  type ScoreDirection,
+} from './score.js';
 import {
   ensureGlobalTestCaseProcessor,
   runInTestCase,
@@ -48,12 +55,140 @@ export const TEST_SUITE_RUN_RESULT_EVENT = "opensearch.test_suite_run.result";
 // Public interfaces
 // ---------------------------------------------------------------------------
 
+/**
+ * One score from a scorer (or passed to `Benchmark.log({ scores: [...] })`).
+ *
+ * Verdict fields are optional; unset ones fall back to the scorer's
+ * `defineScorer()` declaration. `assessment` (or `passed`) is an explicit
+ * verdict and wins; otherwise `threshold` + `direction` is applied to `value`.
+ */
 export interface EvalScore {
   name: string;
-  value: number;
+  /** Numeric score. May be omitted for a verdict-only result. */
+  value?: number;
   label?: string;
   explanation?: string;
   metadata?: Record<string, unknown>;
+  /** Explicit verdict (`opensearch.evaluation.assessment`). Wins over `passed`. */
+  assessment?: Assessment;
+  /** Explicit verdict as a boolean. */
+  passed?: boolean;
+  /** `opensearch.evaluation.score.threshold`. */
+  threshold?: number;
+  /** `opensearch.evaluation.score.direction` (default `maximize` with a threshold). */
+  direction?: ScoreDirection;
+  scoreMin?: number;
+  scoreMax?: number;
+}
+
+/** What a scorer declares about the evaluation it produces (see `defineScorer`). */
+export interface ScorerSpec {
+  /**
+   * `gen_ai.evaluation.name` of number/boolean results and of the error grade
+   * emitted when the scorer throws. Default: the function name.
+   */
+  name?: string;
+  /** Default `maximize` when `threshold` is set. */
+  direction?: ScoreDirection;
+  threshold?: number;
+  scoreMin?: number;
+  scoreMax?: number;
+  /** Evaluator identity: instrumentation scope and `opensearch.evaluation.evaluator.name`. */
+  evaluator?: string;
+  evaluatorType?: EvaluatorType;
+}
+
+export type ScorerFn = (
+  input: unknown,
+  output: unknown,
+  expected: unknown,
+) => EvalScore | EvalScore[] | number | boolean;
+
+/** A scorer function with its declared name and rule attached. */
+export type Scorer = ScorerFn & { readonly scorerSpec: ScorerSpec };
+
+const DIRECTIONS: readonly ScoreDirection[] = ['maximize', 'minimize'];
+const EVALUATOR_TYPES: readonly EvaluatorType[] = ['llm_judge', 'code', 'human', 'external'];
+
+/**
+ * Declare a scorer's evaluation name and pass rule for `evaluate()`.
+ *
+ * ```ts
+ * const quality = defineScorer(
+ *   { name: 'answer_quality', threshold: 4, scoreMin: 1, scoreMax: 5, evaluatorType: 'llm_judge' },
+ *   (input, output) => judge(input, output),
+ * );
+ * ```
+ *
+ * Rule fields are defaults for every score the scorer returns; fields set on a
+ * returned `EvalScore` win. Throws on an unknown `direction` / `evaluatorType`
+ * or a non-finite `threshold` / `scoreMin` / `scoreMax`.
+ */
+export function defineScorer(spec: ScorerSpec, fn: ScorerFn): Scorer {
+  if (spec.direction !== undefined && !DIRECTIONS.includes(spec.direction)) {
+    throw new Error(`direction must be one of ${DIRECTIONS.join(', ')}; got "${spec.direction}"`);
+  }
+  if (spec.evaluatorType !== undefined && !EVALUATOR_TYPES.includes(spec.evaluatorType)) {
+    throw new Error(
+      `evaluatorType must be one of ${EVALUATOR_TYPES.join(', ')}; got "${spec.evaluatorType}"`,
+    );
+  }
+  for (const key of ['threshold', 'scoreMin', 'scoreMax'] as const) {
+    const v = spec[key];
+    if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v))) {
+      throw new Error(`${key} must be a finite number; got ${JSON.stringify(v)}`);
+    }
+  }
+  const resolved: ScorerSpec = {
+    ...spec,
+    direction: spec.direction ?? (spec.threshold !== undefined ? 'maximize' : undefined),
+  };
+  const scorer = ((input: unknown, output: unknown, expected: unknown) =>
+    fn(input, output, expected)) as Scorer;
+  Object.defineProperty(scorer, 'name', { value: fn.name || spec.name || 'score' });
+  Object.defineProperty(scorer, 'scorerSpec', { value: Object.freeze(resolved), enumerable: true });
+  return scorer;
+}
+
+function specOf(fn: ScorerFn): ScorerSpec | undefined {
+  return (fn as Partial<Scorer>).scorerSpec;
+}
+
+/** Fill unset rule fields of a score from its scorer's declaration. */
+function applySpec(s: EvalScore, spec?: ScorerSpec): EvalScore {
+  if (!spec) return s;
+  return {
+    ...s,
+    threshold: s.threshold ?? spec.threshold,
+    direction: s.direction ?? spec.direction,
+    scoreMin: s.scoreMin ?? spec.scoreMin,
+    scoreMax: s.scoreMax ?? spec.scoreMax,
+  };
+}
+
+/** Verdict of a score: explicit `assessment` / `passed`, else threshold rule. */
+function verdictOf(s: EvalScore): Assessment | undefined {
+  let explicit = s.assessment !== undefined ? normalizeAssessment(s.assessment) : undefined;
+  if (explicit === undefined && s.passed !== undefined) explicit = normalizeAssessment(Boolean(s.passed));
+  return resolveAssessment({
+    value: s.value,
+    assessment: explicit,
+    threshold: s.threshold,
+    direction: s.direction,
+  });
+}
+
+function assessmentsOf(scores: EvalScore[]): Record<string, Assessment> {
+  const out: Record<string, Assessment> = {};
+  for (const s of scores) {
+    const v = verdictOf(s);
+    if (v) out[s.name] = v;
+  }
+  return out;
+}
+
+function hasFailVerdict(assessments: Record<string, Assessment>): boolean {
+  return Object.values(assessments).includes('fail');
 }
 
 export interface ScoreSummary {
@@ -88,7 +223,7 @@ export interface TestCaseResult {
   expected: unknown;
   scores: Record<string, number>;
   error?: string;
-  /** Legacy status: `"pass"`, or `"fail"` when the case errored. */
+  /** Legacy status: `"pass"`, or `"fail"` when the case errored or a score failed its verdict. */
   status: string;
   /** `test.case.result.status` emitted on the case event. */
   resultStatus: TestCaseStatus;
@@ -99,6 +234,8 @@ export interface TestCaseResult {
   traceId?: string;
   spanId?: string;
   scorerErrors?: string[];
+  /** Evaluation name to declared verdict, for scores that have one. */
+  assessments?: Record<string, Assessment>;
 }
 
 export interface BenchmarkResult {
@@ -207,6 +344,7 @@ function emitCaseScores(
   scores: EvalScore[],
   identity: CaseIdentity,
   target: { traceId?: string; spanId?: string },
+  extra: { evaluator?: string; evaluatorType?: EvaluatorType; errorType?: string } = {},
 ): void {
   const testAttrs = identityAttributes(identity);
   for (const s of scores) {
@@ -216,6 +354,14 @@ function emitCaseScores(
       value: s.value,
       label: s.label,
       explanation: s.explanation,
+      direction: s.direction,
+      scoreMin: s.scoreMin,
+      scoreMax: s.scoreMax,
+      threshold: s.threshold,
+      assessment: verdictOf(s),
+      evaluator: extra.evaluator,
+      evaluatorType: extra.evaluatorType,
+      errorType: extra.errorType,
       attributes: { ...metadata, ...testAttrs },
       traceId: target.traceId,
       spanId: target.traceId ? target.spanId : undefined,
@@ -223,6 +369,12 @@ function emitCaseScores(
     // No target: do not pick up whatever span the caller has active.
     otelContext.with(ROOT_CONTEXT, () => score(options));
   }
+}
+
+function scoreValues(scores: EvalScore[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of scores) if (s.value !== undefined) out[s.name] = s.value;
+  return out;
 }
 
 function emitEvent(eventName: string, attributes: Attributes, parent?: SpanContext | null): void {
@@ -384,13 +536,17 @@ export class Benchmark {
     input?: unknown;
     output?: unknown;
     expected?: unknown;
-    scores?: Record<string, number>;
+    /** `{ name: value }`, or `EvalScore[]` to declare verdicts (assessment / threshold) and bounds. */
+    scores?: Record<string, number> | EvalScore[];
     metadata?: Record<string, unknown>;
     /** Error message. The case event status becomes `error` (`status` stays `fail`). */
     error?: string;
     /** `error.type` for an errored case (exception class name or similar). */
     errorType?: string;
-    /** Explicit case status. Default `error` when `error` or `errorType` is given, else `pass`. */
+    /**
+     * Explicit case status. Default `error` when `error` or `errorType` is given,
+     * else `fail` when a score has a `fail` verdict, else `pass`.
+     */
     status?: TestCaseStatus;
     caseId?: string;
     caseName?: string;
@@ -417,18 +573,20 @@ export class Benchmark {
     if (options.status !== undefined && !CASE_STATUSES.includes(options.status)) {
       throw new Error(`status must be one of ${CASE_STATUSES.join(', ')}; got "${options.status}"`);
     }
+    const evalScores: EvalScore[] = Array.isArray(options.scores)
+      ? options.scores
+      : Object.entries(options.scores ?? {}).map(([name, value]) => ({ name, value }));
+    const assessments = assessmentsOf(evalScores);
+    const failed = hasFailVerdict(assessments);
     const hasError = options.error !== undefined;
     const resultStatus: TestCaseStatus =
-      options.status ?? (hasError || options.errorType ? 'error' : 'pass');
-    const legacyStatus = options.status ?? (hasError ? 'fail' : 'pass');
+      options.status ?? (hasError || options.errorType ? 'error' : failed ? 'fail' : 'pass');
+    const legacyStatus = options.status ?? (hasError || failed ? 'fail' : 'pass');
     const errorType = options.errorType;
     const caseMeta = toAttributes(safeMetadata(options.metadata, `case:${caseId}`));
     const evaluated = spanContextFrom(options.traceId, options.spanId);
 
-    if (options.scores) {
-      const evalScores: EvalScore[] = Object.entries(options.scores).map(
-        ([name, value]) => ({ name, value }),
-      );
+    if (evalScores.length > 0) {
       emitCaseScores(evalScores, identity, { traceId: options.traceId, spanId: options.spanId });
     }
 
@@ -451,7 +609,7 @@ export class Benchmark {
       input: options.input,
       output: options.output,
       expected: options.expected,
-      scores: options.scores ?? {},
+      scores: scoreValues(evalScores),
       error: options.error,
       status: legacyStatus,
       resultStatus,
@@ -459,6 +617,7 @@ export class Benchmark {
       durationMs: options.durationMs,
       traceId: evaluated?.traceId,
       spanId: evaluated?.spanId,
+      assessments: Object.keys(assessments).length > 0 ? assessments : undefined,
     });
   }
 
@@ -479,13 +638,12 @@ export class Benchmark {
 // evaluate() function
 // ---------------------------------------------------------------------------
 
-type ScorerFn = (input: unknown, output: unknown, expected: unknown) => EvalScore | EvalScore[] | number;
-
 export interface EvaluateOptions {
   name: string;
   task: (input: unknown) => unknown;
   data: Array<{ input: unknown; expected?: unknown; caseId?: string; caseName?: string }>;
-  scores: ScorerFn[];
+  /** Scorer functions, optionally wrapped with `defineScorer()` to declare name and rule. */
+  scores: Array<ScorerFn | Scorer>;
   metadata?: Record<string, unknown>;
   recordIo?: boolean;
 }
@@ -499,6 +657,13 @@ export interface EvaluateOptions {
  * are parented to the agent run's own trace. The TypeScript SDK has no default
  * context manager, so this uses a module-level "current case" instead of the
  * active OTel context.
+ *
+ * Case status (`test.case.result.status`): `error` if the task or a scorer
+ * threw; else `fail` if any score has a `fail` verdict (explicit `assessment`
+ * / `passed`, or `threshold` + `direction` from the score or its
+ * `defineScorer()` declaration); else `pass`. Scores without a declared rule
+ * never fail a case. A scorer that throws emits a grade with `error.type`,
+ * named after its declared `name` (else the function name).
  */
 export function evaluate(options: EvaluateOptions): BenchmarkResult {
   const filteredMetadata = toAttributes(safeMetadata(options.metadata, `evaluate:${options.name}`));
@@ -523,7 +688,7 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
     let error: string | undefined;
     let errorType: string | undefined;
     const caseScores: Record<string, number> = {};
-    const evalScores: EvalScore[] = [];
+    const scoreGroups: Array<{ scores: EvalScore[]; spec?: ScorerSpec; errorType?: string }> = [];
     const scorerErrors: string[] = [];
 
     const active: ActiveTestCase = { attributes: identityAttributes(identity), seen: new Set() };
@@ -546,34 +711,56 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
     // Run scorers (outside the case: judge spans are not the agent run)
     if (error === undefined) {
       for (const scorer of options.scores) {
+        const spec = specOf(scorer);
+        // Evaluation name of number/boolean results and of the error grade.
+        const evalName = spec?.name || scorer.name || 'score';
         try {
           const result = scorer(item.input, output, expected);
-          if (typeof result === 'number') {
-            const scoreName = scorer.name || 'score';
-            const es: EvalScore = { name: scoreName, value: result };
-            evalScores.push(es);
-            caseScores[es.name] = es.value;
+          let produced: EvalScore[];
+          if (typeof result === 'boolean') {
+            produced = [{ name: evalName, value: result ? 1 : 0, passed: result }];
+          } else if (typeof result === 'number') {
+            produced = [{ name: evalName, value: result }];
           } else if (Array.isArray(result)) {
-            for (const es of result) {
-              evalScores.push(es);
-              caseScores[es.name] = es.value;
-            }
+            produced = result;
           } else {
-            evalScores.push(result);
-            caseScores[result.name] = result.value;
+            produced = [result];
           }
+          produced = produced.map(s => applySpec(s, spec));
+          for (const es of produced) {
+            if (es.value !== undefined) caseScores[es.name] = es.value;
+          }
+          scoreGroups.push({ scores: produced, spec });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           scorerErrors.push(msg);
-          errorType ??= errorTypeOf(e);
+          const scorerErrorType = errorTypeOf(e);
+          errorType ??= scorerErrorType;
+          // Error grade (error.type, no value) under the evaluation name the
+          // scorer would have produced, so it is not a separate evaluation.
+          scoreGroups.push({
+            scores: [applySpec({ name: evalName, explanation: msg }, spec)],
+            spec,
+            errorType: scorerErrorType,
+          });
         }
       }
     }
 
-    const resultStatus: TestCaseStatus = errorType ? 'error' : 'pass';
-    const legacyStatus = resultStatus === 'error' ? 'fail' : 'pass';
+    const assessments = assessmentsOf(
+      scoreGroups.filter(g => !g.errorType).flatMap(g => g.scores),
+    );
+    const failed = hasFailVerdict(assessments);
+    const resultStatus: TestCaseStatus = errorType ? 'error' : failed ? 'fail' : 'pass';
+    const legacyStatus = resultStatus === 'pass' ? 'pass' : 'fail';
     const root = active.root;
-    emitCaseScores(evalScores, identity, { traceId: root?.traceId, spanId: root?.spanId });
+    for (const group of scoreGroups) {
+      emitCaseScores(group.scores, identity, { traceId: root?.traceId, spanId: root?.spanId }, {
+        evaluator: group.spec?.evaluator,
+        evaluatorType: group.spec?.evaluatorType,
+        errorType: group.errorType,
+      });
+    }
 
     const durationMs = elapsedMs(caseStart);
     emitCaseEvent({
@@ -604,6 +791,7 @@ export function evaluate(options: EvaluateOptions): BenchmarkResult {
       traceId: root?.traceId,
       spanId: root?.spanId,
       scorerErrors: scorerErrors.length > 0 ? scorerErrors : undefined,
+      assessments: Object.keys(assessments).length > 0 ? assessments : undefined,
     });
   }
 

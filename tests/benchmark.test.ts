@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { context, trace } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
-import { Benchmark, evaluate } from '../src/benchmark.js';
+import { Benchmark, evaluate, defineScorer, type EvalScore } from '../src/benchmark.js';
 import { score } from '../src/score.js';
 import { TestCaseSpanProcessor, installTestCaseProcessor } from '../src/testcase.js';
 import { getFinishedSpans, getFinishedLogRecords, clearSpans } from './setup.js';
@@ -717,5 +717,177 @@ describe('TestCaseSpanProcessor installation', () => {
       context.active(),
     );
     expect(setAttributes).not.toHaveBeenCalled();
+  });
+});
+
+describe('declared scorer rules and verdicts', () => {
+  const ASSESSMENT = 'opensearch.evaluation.assessment';
+  const THRESHOLD = 'opensearch.evaluation.score.threshold';
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+  const grades = () =>
+    Object.fromEntries(scoreRecords().map(r => [r.attributes['gen_ai.evaluation.name'], r]));
+
+  it('defineScorer keeps the function and attaches the spec', () => {
+    const exactScorer = defineScorer({ threshold: 4 }, function exactMatch() { return 4; });
+    expect(exactScorer.name).toBe('exactMatch');
+    expect(exactScorer('q', 'a', undefined)).toBe(4);
+    expect(exactScorer.scorerSpec.direction).toBe('maximize');
+  });
+
+  it('defineScorer validates its spec', () => {
+    expect(() => defineScorer({ direction: 'up' as 'maximize' }, () => 1)).toThrow(/direction/);
+    expect(() => defineScorer({ evaluatorType: 'robot' as 'code' }, () => 1)).toThrow(/evaluatorType/);
+    expect(() => defineScorer({ threshold: Number.NaN }, () => 1)).toThrow(/threshold/);
+  });
+
+  it('names number results after the declaration and applies its rule', () => {
+    const quality = defineScorer(
+      { name: 'answer_quality', threshold: 4, scoreMin: 1, scoreMax: 5, evaluator: 'quality_judge', evaluatorType: 'llm_judge' },
+      function quality() { return 3; },
+    );
+    const result = evaluate({ name: 'decl', task: x => x, data: [{ input: 'q' }], scores: [quality] });
+    const r = grades()['answer_quality'];
+    expect(r.attributes['gen_ai.evaluation.score.value']).toBe(3);
+    expect(r.attributes[THRESHOLD]).toBe(4);
+    expect(r.attributes['opensearch.evaluation.score.direction']).toBe('maximize');
+    expect(r.attributes['opensearch.evaluation.score.min']).toBe(1);
+    expect(r.attributes['opensearch.evaluation.score.max']).toBe(5);
+    expect(r.attributes['opensearch.evaluation.evaluator.name']).toBe('quality_judge');
+    expect(r.attributes['opensearch.evaluation.evaluator.type']).toBe('llm_judge');
+    expect(r.attributes[ASSESSMENT]).toBe('fail');
+    expect(r.instrumentationScope.name).toBe('quality_judge');
+    expect(result.cases[0].scores).toEqual({ answer_quality: 3 });
+    expect(result.cases[0].assessments).toEqual({ answer_quality: 'fail' });
+  });
+
+  it('lets EvalScore fields override the declaration', () => {
+    const latency = defineScorer(
+      { name: 'latency_budget', direction: 'minimize', threshold: 12 },
+      () => ({ name: 'latency_budget', value: 13, threshold: 15 }),
+    );
+    evaluate({ name: 'override', task: x => x, data: [{ input: 'q' }], scores: [latency] });
+    const a = grades()['latency_budget'].attributes;
+    expect(a[THRESHOLD]).toBe(15);
+    expect(a['opensearch.evaluation.score.direction']).toBe('minimize');
+    expect(a[ASSESSMENT]).toBe('pass');
+  });
+
+  it('propagates passed / assessment from returned scores', () => {
+    const checks = (): EvalScore[] => [
+      { name: 'a', value: 0.5, passed: true },
+      { name: 'b', value: 0.5, assessment: 'fail' },
+      { name: 'c', assessment: 'pass' },
+      { name: 'd', value: 0.5, assessment: 'pass', passed: false },
+    ];
+    const result = evaluate({ name: 'explicit', task: x => x, data: [{ input: 'q' }], scores: [checks] });
+    const g = grades();
+    expect(g['a'].attributes[ASSESSMENT]).toBe('pass');
+    expect(g['b'].attributes[ASSESSMENT]).toBe('fail');
+    expect(g['c'].attributes[ASSESSMENT]).toBe('pass');
+    expect(g['c'].attributes['gen_ai.evaluation.score.value']).toBeUndefined();
+    expect(g['d'].attributes[ASSESSMENT]).toBe('pass');
+    expect(result.cases[0].scores).toEqual({ a: 0.5, b: 0.5, d: 0.5 });
+  });
+
+  it('treats a boolean result as a verdict', () => {
+    const tools = defineScorer({ name: 'tool_selection' }, () => false);
+    evaluate({ name: 'bool', task: x => x, data: [{ input: 'q' }], scores: [tools] });
+    const a = grades()['tool_selection'].attributes;
+    expect(a['gen_ai.evaluation.score.value']).toBe(0);
+    expect(a[ASSESSMENT]).toBe('fail');
+  });
+
+  it('keeps case status pass when nothing is declared', () => {
+    const result = evaluate({ name: 'no-rules', task: x => x, data: [{ input: 'q' }], scores: [() => 0] });
+    expect(result.cases[0].status).toBe('pass');
+    expect(result.cases[0].assessments).toBeUndefined();
+    expect(caseEvents()[0].attributes['test.case.result.status']).toBe('pass');
+    expect(scoreRecords()[0].attributes[ASSESSMENT]).toBeUndefined();
+  });
+
+  it('fails a case on a fail verdict; run status reflects errors only', () => {
+    const quality = defineScorer({ name: 'answer_quality', threshold: 4 }, (input) => (input === 'good' ? 5 : 2));
+    const result = evaluate({
+      name: 'verdicts',
+      task: x => x,
+      data: [{ input: 'good', caseId: 'g' }, { input: 'bad', caseId: 'b' }],
+      scores: [quality],
+    });
+    expect(result.cases.map(c => c.status)).toEqual(['pass', 'fail']);
+    expect(result.cases.map(c => c.resultStatus)).toEqual(['pass', 'fail']);
+    const run = runEvents()[0].attributes;
+    expect(run['opensearch.test_suite_run.pass_count']).toBe(1);
+    expect(run['opensearch.test_suite_run.fail_count']).toBe(1);
+    expect(run['test.suite.run.status']).toBe('success');
+  });
+
+  it('error beats a fail verdict', () => {
+    const bad = () => { throw new Error('judge down'); };
+    evaluate({
+      name: 'err-first',
+      task: x => x,
+      data: [{ input: 'q' }],
+      scores: [() => ({ name: 'x', value: 0, passed: false }), bad],
+    });
+    expect(caseEvents()[0].attributes['test.case.result.status']).toBe('error');
+  });
+
+  it('names the error grade after the declared evaluation name', () => {
+    const quality = defineScorer(
+      { name: 'answer_quality', threshold: 4, scoreMin: 1, scoreMax: 5 },
+      function quality(): number { throw new TypeError('judge down'); },
+    );
+    evaluate({ name: 'err-name', task: x => x, data: [{ input: 'q' }], scores: [quality] });
+    const g = grades();
+    expect(Object.keys(g)).toEqual(['answer_quality']);
+    const a = g['answer_quality'].attributes;
+    expect(a['error.type']).toBe('TypeError');
+    expect(a[THRESHOLD]).toBe(4);
+    expect(a[ASSESSMENT]).toBeUndefined();
+    expect(a['gen_ai.evaluation.score.value']).toBeUndefined();
+  });
+
+  it('falls back to the function name for an undeclared scorer that throws', () => {
+    function quality(): number { throw new Error('judge down'); }
+    evaluate({ name: 'err-fn', task: x => x, data: [{ input: 'q' }], scores: [quality] });
+    const g = grades();
+    expect(Object.keys(g)).toEqual(['quality']);
+    expect(g['quality'].attributes['error.type']).toBe('Error');
+  });
+
+  it('Benchmark.log accepts EvalScore[] with verdicts', () => {
+    const bm = new Benchmark('bench-verdicts');
+    bm.log({
+      input: 'q',
+      caseId: 'c1',
+      scores: [
+        { name: 'answer_quality', value: 3, threshold: 4, scoreMin: 1, scoreMax: 5 },
+        { name: 'tool_selection', value: 1, assessment: 'pass' },
+      ],
+    });
+    bm.close();
+    const g = grades();
+    expect(g['answer_quality'].attributes[ASSESSMENT]).toBe('fail');
+    expect(g['answer_quality'].attributes['opensearch.evaluation.score.max']).toBe(5);
+    expect(g['tool_selection'].attributes[ASSESSMENT]).toBe('pass');
+    expect(caseEvents()[0].attributes['test.case.result.status']).toBe('fail');
+  });
+
+  it('Benchmark.log keeps dict scores neutral and explicit status wins', () => {
+    const bm = new Benchmark('bench-dict');
+    bm.log({ input: 'q', caseId: 'a', scores: { accuracy: 0 } });
+    bm.log({ input: 'q', caseId: 'b', scores: [{ name: 'x', value: 0, passed: false }], status: 'pass' });
+    bm.close();
+    expect(caseEvents().map(e => e.attributes['test.case.result.status'])).toEqual(['pass', 'pass']);
+    expect(scoreRecords()[0].attributes[ASSESSMENT]).toBeUndefined();
   });
 });

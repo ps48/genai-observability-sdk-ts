@@ -21,6 +21,9 @@ const EXPLANATION_LIMIT = 500;
 export type EvaluationLevel = "span" | "trace" | "session" | "tool_call";
 export type EvaluatorType = "llm_judge" | "code" | "human" | "external";
 export type ScoreDirection = "maximize" | "minimize";
+/** `opensearch.evaluation.assessment`: an explicit verdict. */
+export type Assessment = "pass" | "fail";
+const ASSESSMENTS: readonly Assessment[] = ["pass", "fail"];
 
 export interface ScoreOptions {
   /** `gen_ai.evaluation.name` (required), for example `"relevance"`. */
@@ -58,6 +61,19 @@ export interface ScoreOptions {
   scoreMin?: number;
   /** `opensearch.evaluation.score.max`. */
   scoreMax?: number;
+  /**
+   * `opensearch.evaluation.score.threshold`: pass when `value >= threshold`
+   * (`direction` `"maximize"`, the default with a threshold and recorded) or
+   * `value <= threshold` (`"minimize"`).
+   */
+  threshold?: number;
+  /**
+   * `opensearch.evaluation.assessment`: explicit verdict, `"pass"` or `"fail"`
+   * (`true` / `false` accepted). Wins over `threshold`. Without it, a `value`
+   * plus `threshold` computes and records the assessment. Invalid values are
+   * dropped with a warning.
+   */
+  assessment?: Assessment | boolean;
   /** `gen_ai.conversation.id` (session-scoped evaluations). */
   conversationId?: string;
   /** `gen_ai.agent.name` of the evaluated agent. */
@@ -112,6 +128,42 @@ function resolveTarget(traceId?: string, spanId?: string): Target {
   };
 }
 
+/**
+ * Normalize an assessment: `"pass"` / `"fail"` (any case, trimmed) or a boolean.
+ * Returns undefined, with a warning, for anything else.
+ */
+export function normalizeAssessment(assessment: unknown): Assessment | undefined {
+  if (assessment === undefined || assessment === null) return undefined;
+  if (typeof assessment === 'boolean') return assessment ? 'pass' : 'fail';
+  if (typeof assessment === 'string') {
+    const normalized = assessment.trim().toLowerCase();
+    if ((ASSESSMENTS as readonly string[]).includes(normalized)) return normalized as Assessment;
+  }
+  console.warn(
+    `score(): assessment ${JSON.stringify(assessment)} is not one of ${ASSESSMENTS.join(', ')}; not recording it`,
+  );
+  return undefined;
+}
+
+/**
+ * Verdict of one result: a valid explicit `assessment` wins; else with both
+ * `value` and `threshold`, `pass` when `value >= threshold` (`maximize`, the
+ * default) or `value <= threshold` (`minimize`), else `fail`; else undefined
+ * (no declared rule: readers show the result as neutral).
+ */
+export function resolveAssessment(options: {
+  value?: number;
+  assessment?: unknown;
+  threshold?: number;
+  direction?: ScoreDirection;
+}): Assessment | undefined {
+  const explicit = normalizeAssessment(options.assessment);
+  if (explicit) return explicit;
+  if (options.value === undefined || options.threshold === undefined) return undefined;
+  if (options.direction === 'minimize') return options.value <= options.threshold ? 'pass' : 'fail';
+  return options.value >= options.threshold ? 'pass' : 'fail';
+}
+
 function buildAttributes(options: ScoreOptions, target: Target): Attributes {
   const attrs: Attributes = {};
   if (options.attributes) {
@@ -141,9 +193,21 @@ function buildAttributes(options: ScoreOptions, target: Target): Attributes {
     attrs["opensearch.evaluation.evaluator.version"] = options.evaluatorVersion;
   }
   if (options.evaluatorType) attrs["opensearch.evaluation.evaluator.type"] = options.evaluatorType;
-  if (options.direction) attrs["opensearch.evaluation.score.direction"] = options.direction;
+  const direction =
+    options.direction ?? (options.threshold !== undefined ? 'maximize' : undefined);
+  if (direction) attrs["opensearch.evaluation.score.direction"] = direction;
   if (options.scoreMin !== undefined) attrs["opensearch.evaluation.score.min"] = options.scoreMin;
   if (options.scoreMax !== undefined) attrs["opensearch.evaluation.score.max"] = options.scoreMax;
+  if (options.threshold !== undefined) {
+    attrs["opensearch.evaluation.score.threshold"] = options.threshold;
+  }
+  const verdict = resolveAssessment({
+    value: options.value,
+    assessment: options.assessment,
+    threshold: options.threshold,
+    direction,
+  });
+  if (verdict) attrs["opensearch.evaluation.assessment"] = verdict;
   if (options.judgeTraceId) attrs["opensearch.evaluation.judge.trace_id"] = options.judgeTraceId;
   return attrs;
 }
@@ -172,6 +236,10 @@ function emitEvent(options: ScoreOptions, target: Target, attributes: Attributes
  * - Offline: pass `traceId` + `spanId` of the evaluated span.
  * - Trace-level: pass only `traceId`. The event has no span context and carries
  *   `opensearch.evaluation.trace_id` and `opensearch.evaluation.level=trace`.
+ *
+ * Verdict: readers show pass/fail only for a declared rule. Pass `assessment`
+ * (explicit) or `threshold` (+ `direction`); with `value` and `threshold` the
+ * SDK also records the computed `opensearch.evaluation.assessment`.
  */
 export function score(options: ScoreOptions): void {
   const target = resolveTarget(options.traceId, options.spanId);

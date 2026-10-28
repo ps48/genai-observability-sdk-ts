@@ -243,3 +243,63 @@ describe('score', () => {
     expect(r.instrumentationScope.version).toBe(SDK_VERSION);
   });
 });
+
+describe('score verdicts', () => {
+  const ASSESSMENT = 'opensearch.evaluation.assessment';
+  const THRESHOLD = 'opensearch.evaluation.score.threshold';
+  const DIRECTION = 'opensearch.evaluation.score.direction';
+
+  it('records no verdict without a rule', () => {
+    score({ name: 'relevance', value: 0.9 });
+    const a = onlyRecord().attributes;
+    expect(a[ASSESSMENT]).toBeUndefined();
+    expect(a[THRESHOLD]).toBeUndefined();
+    expect(a[DIRECTION]).toBeUndefined();
+  });
+
+  it('records an explicit assessment, normalized', () => {
+    score({ name: 'a', assessment: 'pass' });
+    score({ name: 'b', assessment: ' FAIL ' as 'fail' });
+    score({ name: 'c', assessment: true });
+    expect(getFinishedLogRecords().map(r => r.attributes[ASSESSMENT])).toEqual(['pass', 'fail', 'pass']);
+  });
+
+  it('drops an invalid assessment with a warning', () => {
+    score({ name: 'a', value: 1, assessment: 'maybe' as 'pass' });
+    expect(onlyRecord().attributes[ASSESSMENT]).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('assessment'));
+  });
+
+  it('computes the assessment from threshold (maximize by default)', () => {
+    score({ name: 'q', value: 4, threshold: 4 });
+    score({ name: 'q', value: 3, threshold: 4 });
+    const [a, b] = getFinishedLogRecords().map(r => r.attributes);
+    expect(a[THRESHOLD]).toBe(4);
+    expect(a[DIRECTION]).toBe('maximize');
+    expect(a[ASSESSMENT]).toBe('pass');
+    expect(b[ASSESSMENT]).toBe('fail');
+  });
+
+  it('applies minimize thresholds', () => {
+    score({ name: 'latency', value: 12, threshold: 12, direction: 'minimize' });
+    score({ name: 'latency', value: 12.5, threshold: 12, direction: 'minimize' });
+    const [a, b] = getFinishedLogRecords().map(r => r.attributes);
+    expect(a[DIRECTION]).toBe('minimize');
+    expect(a[ASSESSMENT]).toBe('pass');
+    expect(b[ASSESSMENT]).toBe('fail');
+  });
+
+  it('lets an explicit assessment win over the threshold', () => {
+    score({ name: 'q', value: 1, threshold: 4, assessment: 'pass' });
+    const a = onlyRecord().attributes;
+    expect(a[ASSESSMENT]).toBe('pass');
+    expect(a[THRESHOLD]).toBe(4);
+  });
+
+  it('records a threshold without a value but no verdict', () => {
+    score({ name: 'q', threshold: 4, errorType: 'TimeoutError' });
+    const a = onlyRecord().attributes;
+    expect(a[THRESHOLD]).toBe(4);
+    expect(a[ASSESSMENT]).toBeUndefined();
+  });
+});

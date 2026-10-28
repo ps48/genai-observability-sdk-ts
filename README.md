@@ -393,7 +393,7 @@ score({ name: "task_success", value: 1, traceId: "6ebb9835f43af1552f2cebb9f5165e
 
 The instrumentation scope of the event is always set: the evaluator (`evaluator` / `evaluatorVersion`), or `opensearch-genai-observability-sdk-ts` and the SDK version when no evaluator is named. Every logger the SDK creates (grades, case and run events) also carries the scope attributes `opensearch.genai.sdk.name` = `opensearch-genai-observability-sdk-ts` and `opensearch.genai.sdk.version` = the SDK version. The grade source (`attributes.derived.evaluation.source = opensearch-sdk` in the evaluation index) is derived from the scope, so custom evaluator names still count as SDK grades. The timestamp is the time `score()` is called.
 
-**Scores are doubles.** `gen_ai.evaluation.score.value` is a double in the OTel semantic conventions, but OTel JS encodes any whole JS number (for example `1`) as an OTLP `intValue`, and the logs API has no way to request a double. The SDK's own log exporters (the OTLP/HTTP exporter `register()` creates, and `AWSSigV4OTLPLogExporter`) re-encode whole-number `gen_ai.evaluation.score.value`, `opensearch.evaluation.score.min` / `.max` and the `duration_ms` attributes as `doubleValue`. With your own `logExporter` or a global `LoggerProvider` you configured, whole numbers are sent as `intValue`. The OpenSearch evaluation index maps the field as `double`, so stored values are the same either way.
+**Scores are doubles.** `gen_ai.evaluation.score.value` is a double in the OTel semantic conventions, but OTel JS encodes any whole JS number (for example `1`) as an OTLP `intValue`, and the logs API has no way to request a double. The SDK's own log exporters (the OTLP/HTTP exporter `register()` creates, and `AWSSigV4OTLPLogExporter`) re-encode whole-number `gen_ai.evaluation.score.value`, `opensearch.evaluation.score.min` / `.max` / `.threshold` and the `duration_ms` attributes as `doubleValue`. With your own `logExporter` or a global `LoggerProvider` you configured, whole numbers are sent as `intValue`. The OpenSearch evaluation index maps the field as `double`, so stored values are the same either way.
 
 **Parameters:**
 
@@ -412,6 +412,8 @@ The instrumentation scope of the event is always set: the evaluator (`evaluator`
 | `evaluatorType` | `"llm_judge" \| "code" \| "human" \| "external"` | `opensearch.evaluation.evaluator.type` | Kind of evaluator |
 | `direction` | `"maximize" \| "minimize"` | `opensearch.evaluation.score.direction` | Whether higher is better |
 | `scoreMin` / `scoreMax` | `number` | `opensearch.evaluation.score.min` / `.max` | Scale bounds |
+| `threshold` | `number` | `opensearch.evaluation.score.threshold` | Pass threshold. `direction` defaults to `maximize` (recorded) |
+| `assessment` | `"pass" \| "fail" \| boolean` | `opensearch.evaluation.assessment` | Explicit verdict. Invalid values are dropped with a warning |
 | `conversationId` | `string` | `gen_ai.conversation.id` | Session id for session-scoped evaluations |
 | `agentName` | `string` | `gen_ai.agent.name` | Evaluated agent |
 | `errorType` | `string` | `error.type` | Set when the evaluator failed |
@@ -421,6 +423,14 @@ The instrumentation scope of the event is always set: the evaluator (`evaluator`
 `opensearch.evaluation.*` attributes are OpenSearch extensions for fields that are still proposals in the GenAI semantic conventions. They will move to `gen_ai.*` names when those proposals merge.
 
 A trace-level score (only `traceId`) is never attached to a span id derived from the trace id.
+
+**Verdicts.** OpenSearch Dashboards shows pass/fail only for a declared rule; a result without one is neutral ("Scored"). Declare the rule with `assessment` (explicit verdict) or `threshold` (+ `direction`). When `value` and `threshold` are given without `assessment`, the SDK computes the assessment and records it too: `pass` if `value >= threshold` (`maximize`) or `value <= threshold` (`minimize`), else `fail`. An explicit `assessment` always wins.
+
+```typescript
+score({ name: "answer_quality", value: 3, threshold: 4, scoreMin: 1, scoreMax: 5 }); // assessment=fail
+score({ name: "latency_s", value: 9.2, threshold: 12, direction: "minimize" });      // assessment=pass
+score({ name: "tool_selection", value: 1, assessment: "pass" });
+```
 
 ### `evaluate()`
 
@@ -484,15 +494,37 @@ const provider = new BasicTracerProvider({
 | `name` | `string` | Benchmark name (`test.suite.name`). Stable across runs |
 | `task` | `(input: unknown) => unknown` | Synchronous function that takes input and returns output |
 | `data` | `Array<{ input, expected?, caseId?, caseName? }>` | Test cases |
-| `scores` | `ScorerFn[]` | Scorer functions: `(input, output, expected)` returning `EvalScore`, `EvalScore[]`, or `number` |
+| `scores` | `Array<ScorerFn \| Scorer>` | Scorer functions: `(input, output, expected)` returning `EvalScore`, `EvalScore[]`, `number`, or `boolean`. Optionally wrapped with `defineScorer()` |
 | `metadata` | `Record<string, unknown>` | Copied to the case and run events. Reserved keys are filtered |
 | `recordIo` | `boolean` | Record input/expected/output as `opensearch.test_case.*` on the case event (default `false`) |
 
-Each `TestCaseResult` has `status` (`pass`, or `fail` when the case errored, as before), `resultStatus` (`pass` | `fail` | `error`, as emitted), `errorType`, `durationMs`, and the `traceId` / `spanId` of the agent root span when the task created one.
+Each `TestCaseResult` has `status` (`pass`, or `fail` when the case errored or failed a verdict), `resultStatus` (`pass` | `fail` | `error`, as emitted), `errorType`, `durationMs`, `assessments` (evaluation name to verdict), and the `traceId` / `spanId` of the agent root span when the task created one.
+
+**Declaring rules.** Wrap a scorer with `defineScorer(spec, fn)` to declare its evaluation name and pass rule up front. A scorer may also return a `boolean` (a verdict) or an `EvalScore` with `assessment` (`"pass"` / `"fail"`), `passed`, `threshold`, `direction`, `scoreMin`, `scoreMax`; fields set on the `EvalScore` win over the declaration.
+
+```typescript
+import { defineScorer } from "opensearch-genai-observability-sdk-ts";
+
+const quality = defineScorer(
+  { name: "answer_quality", threshold: 4, scoreMin: 1, scoreMax: 5, evaluatorType: "llm_judge" },
+  (input, output) => judge(input, output), // number: named "answer_quality", verdict from threshold
+);
+const latency = defineScorer(
+  { name: "latency_budget", direction: "minimize", threshold: 12 },
+  () => secondsTaken, // pass when <= 12
+);
+const tools = defineScorer({ name: "tool_selection" }, () => ({
+  name: "tool_selection", value: hitRate, passed: hitRate === 1,
+}));
+```
+
+`ScorerSpec` fields: `name` (evaluation name of number/boolean results and of the error grade; default the function name), `threshold`, `direction` (default `maximize` with a threshold), `scoreMin` / `scoreMax`, `evaluator` (scope and `evaluator.name`), `evaluatorType`. A scorer that throws emits a grade with `error.type` and no value under the declared `name` (else the function name), so it lands on the same evaluation as its successful results.
+
+**Case status** (`test.case.result.status`): `error` if the task or any scorer threw; else `fail` if any score of the case has a `fail` verdict (explicit `assessment` / `passed`, or `threshold` + `direction`); else `pass`. Scores with no declared rule never fail a case, so without declarations the status is as before (`pass` unless something threw). The run status (`test.suite.run.status`) still reflects errors only.
 
 ### `Benchmark`
 
-Upload pre-computed evaluation results from any framework. Each `log()` emits one `gen_ai.evaluation.result` event per score and one `opensearch.test_case.result` event, both parented to the evaluated agent span when `traceId` and `spanId` are given. With only `traceId`, scores are trace-level and the case event has no trace context; with neither, no event has trace context. `error` or `errorType` marks the case `error` (`error.type` from `errorType`); `status` sets `pass`, `fail` or `error` explicitly. `close()` emits the `opensearch.test_suite_run.result` event. No spans are created.
+Upload pre-computed evaluation results from any framework. Each `log()` emits one `gen_ai.evaluation.result` event per score and one `opensearch.test_case.result` event, both parented to the evaluated agent span when `traceId` and `spanId` are given. With only `traceId`, scores are trace-level and the case event has no trace context; with neither, no event has trace context. `error` or `errorType` marks the case `error` (`error.type` from `errorType`); otherwise a `fail` verdict marks it `fail`; `status` sets `pass`, `fail` or `error` explicitly. `scores` is `{ name: value }` or an `EvalScore[]` (to declare `assessment` / `threshold` / bounds). `close()` emits the `opensearch.test_suite_run.result` event. No spans are created.
 
 ```typescript
 import { Benchmark } from "opensearch-genai-observability-sdk-ts";
@@ -516,6 +548,16 @@ bench.log({
   traceId: "6ebb9835f43af1552f2cebb9f5165e39",
   spanId: "89829115c2128845",
   durationMs: 840,
+});
+
+// Declare verdicts: the case fails because answer_quality is below its threshold
+bench.log({
+  input: "query",
+  output: "answer",
+  scores: [
+    { name: "answer_quality", value: 3, threshold: 4, scoreMin: 1, scoreMax: 5 },
+    { name: "tool_selection", value: 1, assessment: "pass" },
+  ],
 });
 
 const summary = bench.close();
